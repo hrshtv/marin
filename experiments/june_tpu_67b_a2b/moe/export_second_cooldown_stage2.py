@@ -1,5 +1,4 @@
 import dataclasses
-import math
 import os
 from typing import Any, cast
 
@@ -13,8 +12,8 @@ from levanter.grug.sharding import compact_grug_mesh
 from levanter.tokenizers import load_tokenizer
 
 from experiments.grug.moe.model import GrugModelConfig, Transformer
-from experiments.june_tpu_67b_a2b.moe.heuristic_muonh import MoeMuonHHeuristic
 from experiments.june_tpu_67b_a2b.moe.model import GrugModelConfig as VendoredGrugModelConfig
+from experiments.june_tpu_67b_a2b.moe.snowball_chat_recipe import SNOWBALL_CHAT_MODEL_CONFIG
 from experiments.june_tpu_67b_a2b.moe.model import Transformer as VendoredTransformer
 from experiments.marin_tokenizer import MARIN_CHAT_TEMPLATE
 
@@ -43,18 +42,10 @@ TOKENIZER = os.environ.get("SNOWBALL_EXPORT_TOKENIZER", "marin-community/marin-t
 EXPERT_AXIS = int(os.environ.get("SNOWBALL_EXPORT_EXPERT_AXIS", "1"))
 REPLICA_AXIS = os.environ.get("SNOWBALL_EXPORT_REPLICA_AXIS")
 
-qk_mult = 1.3 * (0.1 * math.log(65_536 / 8_192) + 1.0)
-model_config = dataclasses.replace(
-    MoeMuonHHeuristic(min_lr_ratio=0.05).build_model_config(2560, seq_len=65_536),
-    disable_pko=True,
-    disable_long_rope=True,
-    sliding_window=2048,
-    use_array_stacked_blocks=True,
-    qk_mult=qk_mult,
-    max_seq_len=32_768,
-    attention_implementation="gpu_fa4_cute",
-    ce_implementation="batched_xla",
-)
+# The architecture the export writes into config.json must be the one the checkpoint was
+# imported and trained with, so it comes from the recipe (and from there, from the selected
+# base model) rather than being restated here.
+model_config = SNOWBALL_CHAT_MODEL_CONFIG
 model_dict = dataclasses.asdict(model_config)
 vendored_config = draccus.decode(VendoredGrugModelConfig, model_dict)
 main_fields = {field.name for field in dataclasses.fields(GrugModelConfig)}

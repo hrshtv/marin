@@ -48,6 +48,7 @@ from experiments.june_tpu_67b_a2b.moe.snowball_chat_recipe import (
     SNOWBALL_CHAT_REPLICA_AXIS,
     SNOWBALL_CHAT_SEED,
     SNOWBALL_CHAT_SEQUENCE_LENGTH,
+    selected_base_model,
     SNOWBALL_CHAT_STEPS,
     SNOWBALL_CHAT_TOKENS,
     SNOWBALL_NATIVE_PARAMETERS,
@@ -423,9 +424,10 @@ def validate_chat_cache_layout(
     return total_tokens, total_examples, len(typed_finished_shards)
 
 
-# sha256 of the pinned Snowball tokenizer. Every stage in the lineage must use the
-# identical tokenizer; a silent swap would corrupt the chained weights-only init.
-SNOWBALL_TOKENIZER_SHA256 = "881c9c36c359e1617afef6f7583403567931b7b4f43f6552d2b2155a131650a2"
+# sha256 of the selected base model's tokenizer (snowball_chat_recipe.BASE_MODELS). Every
+# stage in a lineage must use the identical tokenizer; a silent swap would corrupt the chained
+# weights-only init.
+SNOWBALL_TOKENIZER_SHA256 = selected_base_model().tokenizer_sha256
 
 
 def _validate_tokenizer(tokenizer_path: str) -> int:
