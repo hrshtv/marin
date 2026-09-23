@@ -716,9 +716,9 @@ STAGES: dict[str, StageSpec] = {
     # tokens the model emits, not the release's text tags. ~63M tokens, ~31 packed steps per epoch;
     # max_steps caps EPOCHS x epoch at about eleven epochs.
     # 2026-09-22: the AgentTrove + RST mix for the Grug 09.21 base (SNOWBALL_BASE_MODEL=grug0921).
-    # 49,856 AgentTrove rows (filtered: no harness exception, every turn parses under harbor's Terminus-2
+    # 49,866 AgentTrove rows (filtered: no harness exception, every turn parses under harbor's Terminus-2
     # parser, every turn has reasoning, exp_tas/unknown dropped, >= 3 turns; per-source cap 6,500) +
-    # 6,819 RST GLM-5.3 reward-1 >= 5-turn traces (cap 3 per task) repeated twice = 63,494 rows, 755.9M
+    # 6,8xx RST GLM-5.3 reward-1 >= 5-turn traces (cap 3 per task) repeated twice = 63.5k rows, 755.1M
     # tokens, RST 27 % of tokens; ~371 packed steps per epoch. Built by data/build_agenttrove_rst_mix.py;
     # the pin is the sha256 of the set's SHA256SUMS.
     "agenttrove_rst": StageSpec(
@@ -730,7 +730,7 @@ STAGES: dict[str, StageSpec] = {
         cache_tokens=None,
         cache_examples=None,
         cache_shards=1,
-        dataset_revision="5ce44d5c4d6affa482e765637584bc649f1ade3f",
+        dataset_revision="fb9c72e6635d581032b386858e5f08ea513e6520",
         source_files=1,
         chat_template=MARIN_CHAT_TEMPLATE,
         fixed_steps=None,
