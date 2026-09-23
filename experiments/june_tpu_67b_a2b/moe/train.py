@@ -144,6 +144,11 @@ class GrugTrainerConfig:
     tail_ramp_steps: int = 0
     tail_num_docs: int | None = None
     tail_score_out: str | None = None
+    # Keep the imported router biases fixed: skip the per-step load-balancing overwrite
+    # (_apply_qb_betas) and undo any optimizer update on them. This is what the Grug 09.21 SFT did
+    # ("router biases and deferred load-balancing bias updates stayed frozen"); the default
+    # re-derives the biases from zero on the SFT data.
+    freeze_router_bias: bool = False
     # LR-schedule horizon in steps; None => num_train_steps. Set it LONGER than num_train_steps to train the
     # first part of a longer schedule now (e.g. one epoch of a two-epoch cosine) and resume later on the same
     # output with a larger num_train_steps: the loop picks up this run's own checkpoint (optimizer state and
@@ -436,6 +441,24 @@ def _apply_qb_betas(model: Transformer, qb_betas: jax.Array) -> Transformer:
     return eqx.tree_at(lambda t: t.blocks, model, tuple(new_blocks))
 
 
+def _copy_router_bias(model: Transformer, source: Transformer) -> Transformer:
+    """Return ``model`` with every router bias taken from ``source`` (used to hold them frozen)."""
+    if model.stacked_blocks is not None:
+        return eqx.tree_at(
+            lambda t: t.stacked_blocks.stacked.mlp.router_bias,
+            model,
+            source.stacked_blocks.stacked.mlp.router_bias,
+        )
+    assert model.blocks is not None
+    new_blocks = list(model.blocks)
+    for i, (block, src_block) in enumerate(zip(model.blocks, source.blocks, strict=True)):
+        if not isinstance(block, Block) or block.mlp is None:
+            continue
+        new_mlp = eqx.tree_at(lambda m: m.router_bias, block.mlp, src_block.mlp.router_bias)
+        new_blocks[i] = eqx.tree_at(lambda b: b.mlp, block, new_mlp)
+    return eqx.tree_at(lambda t: t.blocks, model, tuple(new_blocks))
+
+
 def initial_state(
     model_config: GrugModelConfig,
     *,
@@ -495,6 +518,7 @@ def _make_train_step(
     ema_beta: float | None,
     watch_config: WatchConfig | None = None,
     tail: "TailSettings | None" = None,
+    freeze_router_bias: bool = False,
 ):
     one = jnp.array(1, dtype=jnp.int32)
     z_loss = z_loss_weight if z_loss_weight > 0 else None
@@ -512,11 +536,15 @@ def _make_train_step(
     def train_step(state: GrugTrainState, batch, *, compute_watch: bool = False):
         # Apply pending QB betas to router biases inside JIT (avoids eager
         # host-side TPU kernel launches that can cause SPMD sync issues).
-        qb_params = _apply_qb_betas(state.params, state.pending_qb_betas)
-        if ema_beta is not None:
-            qb_ema_params = _apply_qb_betas(state.ema_params, state.pending_qb_betas)
+        if freeze_router_bias:
+            qb_params = state.params
+            qb_ema_params = state.ema_params if ema_beta is not None else None
         else:
-            qb_ema_params = None
+            qb_params = _apply_qb_betas(state.params, state.pending_qb_betas)
+            if ema_beta is not None:
+                qb_ema_params = _apply_qb_betas(state.ema_params, state.pending_qb_betas)
+            else:
+                qb_ema_params = None
 
         if tail is None:
 
@@ -561,6 +589,8 @@ def _make_train_step(
         metrics = {"train/loss": loss, **summarized_metrics}
         updates, opt_state = optimizer.update(grads, state.opt_state, qb_params)
         params = optax.apply_updates(qb_params, updates)
+        if freeze_router_bias:
+            params = _copy_router_bias(params, state.params)
 
         if ema_beta is None:
             ema_params = None
@@ -594,7 +624,7 @@ def _make_train_step(
             params=params,
             opt_state=opt_state,
             ema_params=ema_params,
-            pending_qb_betas=metrics["qb_beta_per_layer"],
+            pending_qb_betas=state.pending_qb_betas if freeze_router_bias else metrics["qb_beta_per_layer"],
         )
 
         return next_state, metrics, watch_stats
@@ -789,7 +819,10 @@ def run_grug_local(config: GrugRunConfig) -> None:
         ema_beta=config.trainer.ema_beta,
         watch_config=watch_config if watch_config.is_enabled else None,
         tail=tail,
+        freeze_router_bias=config.trainer.freeze_router_bias,
     )
+    if config.trainer.freeze_router_bias:
+        logger.info("Router biases FROZEN: keeping the imported values, no load-balancing update")
 
     data_key, model_key = jax.random.split(jax.random.PRNGKey(trainer.seed), 2)
     if config.trainer.data_seed is not None:

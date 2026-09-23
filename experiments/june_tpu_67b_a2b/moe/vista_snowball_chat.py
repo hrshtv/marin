@@ -1113,6 +1113,8 @@ def snowball_chat_run_config(
             tail_ramp_steps=tail_ramp,
             tail_num_docs=tail_num_docs,
             tail_score_out=tail_score_out,
+            # SNOWBALL_FREEZE_ROUTER_BIAS=1 keeps the imported router biases fixed (the Grug 09.21 SFT recipe).
+            freeze_router_bias=os.environ.get("SNOWBALL_FREEZE_ROUTER_BIAS", "0") == "1",
             schedule_steps=schedule_steps,
         ),
         eval=None,
