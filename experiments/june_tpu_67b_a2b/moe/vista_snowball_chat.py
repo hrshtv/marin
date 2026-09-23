@@ -736,6 +736,27 @@ STAGES: dict[str, StageSpec] = {
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
+    # Run 3 of the Grug 09.21 SFT (2026-09-23): the same AgentTrove + RST selection re-filtered at a 64k
+    # packing length (keeps the >32k grinds: 51,690 AgentTrove + 7,641 RST x2), plus Bespoke's Qwen/GLM
+    # Terminus-2 passes (331 traces with reasoning on every turn, x3) = 67,875 rows / 926.4M tokens,
+    # Bespoke 2.8 % of tokens; ~227 packed steps per epoch at 64 x 65,536. Run with SNOWBALL_SEQ_LEN=65536.
+    # Built by data/build_agenttrove_rst_mix.py (PACK_LEN=65536) then data/build_bespoke_mix_v2.py; the pin
+    # is the sha256 of the set's SHA256SUMS.
+    "agenttrove_rst_bespoke_64k": StageSpec(
+        "conversations",
+        "agenttrove_rst_bespoke_64k_v3",
+        "s4_agenttrove_rst_bespoke_64k",
+        1200,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="b9ff17c2f2553c0da5b103231c2bfe6614c2af00",
+        source_files=1,
+        chat_template=MARIN_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
     "kimi_swesmith": StageSpec(
         "conversations",
         "kimi_swesmith_v1",
@@ -1049,7 +1070,7 @@ def snowball_chat_run_config(
             project="marin_moe_sft",
             name=run_id,
             group="grug-67b-a2b-sft",
-            tags=["moe", "67b_a2b", "sft", STAGES[stage].wandb_tag, "seq32768", "vista-gh200"],
+            tags=["moe", "67b_a2b", "sft", STAGES[stage].wandb_tag, f"seq{SNOWBALL_CHAT_SEQUENCE_LENGTH}", "vista-gh200"],
             mode="offline",
         ),
         use_explicit_mesh_axes=True,

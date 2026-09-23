@@ -50,7 +50,9 @@ def selected_base_model() -> BaseModel:
         raise ValueError(f"{BASE_MODEL_ENV}={name!r}; expected one of {sorted(BASE_MODELS)}")
     return BASE_MODELS[name]
 
-SNOWBALL_CHAT_SEQUENCE_LENGTH = 32_768
+# Packing length. 32,768 is the pinned Snowball Chat contract; SNOWBALL_SEQ_LEN overrides it for one run
+# (the Grug 09.21 64k arm). Batch size is unchanged, so tokens per step scale with it.
+SNOWBALL_CHAT_SEQUENCE_LENGTH = int(os.environ.get("SNOWBALL_SEQ_LEN", 32_768))
 SNOWBALL_CHAT_BATCH_SIZE = 64
 SNOWBALL_CHAT_STEPS = 257
 SNOWBALL_CHAT_TOKENS = 538_877_811
