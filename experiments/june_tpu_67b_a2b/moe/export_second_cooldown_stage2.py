@@ -86,9 +86,19 @@ with set_mesh(mesh):
     pending_qb_betas = state["pending_qb_betas"]
     del state
     assert params.stacked_blocks is not None
-    router_bias = -pending_qb_betas
-    router_bias -= jnp.mean(router_bias, axis=-1, keepdims=True)
-    params = eqx.tree_at(lambda tree: tree.stacked_blocks.stacked.mlp.router_bias, params, router_bias)
+    # The unfrozen trainer sets router_bias := -pending_qb_betas each step, so the exported bias is the
+    # centred negative of the final QB state. A frozen run (SNOWBALL_FREEZE_ROUTER_BIAS=1) never touches
+    # pending_qb_betas -- it stays exactly zero -- and the imported HF biases live in params.router_bias;
+    # writing -0 there exported an all-zero bias and a model that routes differently from the one trained
+    # (Grug 09.21 runs 1-2, 2026-09-23). Keep the model's own biases in that case.
+    qb_max_abs = float(jax.device_get(jnp.max(jnp.abs(pending_qb_betas))))
+    if qb_max_abs == 0.0:
+        print("pending_qb_betas is exactly zero: exporting params.router_bias as trained (frozen / imported biases)", flush=True)
+    else:
+        router_bias = -pending_qb_betas
+        router_bias -= jnp.mean(router_bias, axis=-1, keepdims=True)
+        params = eqx.tree_at(lambda tree: tree.stacked_blocks.stacked.mlp.router_bias, params, router_bias)
+        print(f"router_bias := -pending_qb_betas (max abs {qb_max_abs:.4f})", flush=True)
     del pending_qb_betas
     params = jax.tree.map(
         lambda value: value.astype(jnp.bfloat16) if eqx.is_inexact_array(value) else value,
