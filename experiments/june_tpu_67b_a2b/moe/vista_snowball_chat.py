@@ -777,6 +777,25 @@ STAGES: dict[str, StageSpec] = {
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
+    # Run 5 of the Grug 09.21 SFT (2026-09-25): v4 plus the model's own verification-gated successes
+    # (run 2 export sampled pass@8 on 374 RTS + 400 ET tasks; kept iff reward 1, a clean check within 3 command turns
+    # before the first task_complete, no fix in the done turn; parse-failed turns spliced out). 632187256 tokens at 64k.
+    # Built by data/build_rft_v5.py + data/build_mix_v5.py; the pin is the sha256 of the set's SHA256SUMS.
+    "mix_64k_v5": StageSpec(
+        "conversations",
+        "mix_64k_v5",
+        "s4_mix_64k_v5",
+        1200,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="0186f4d6e4e6118fa16d7937ab8b04e9843e1649",
+        source_files=1,
+        chat_template=MARIN_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
     "kimi_swesmith": StageSpec(
         "conversations",
         "kimi_swesmith_v1",
