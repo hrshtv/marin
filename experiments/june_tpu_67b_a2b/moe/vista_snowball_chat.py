@@ -757,6 +757,26 @@ STAGES: dict[str, StageSpec] = {
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
+    # Run 4 of the Grug 09.21 SFT (2026-09-24): the data hypothesis. AgentTrove SWE/project sources only
+    # (swesmith, r2egym, repo scaffold, SWEGym, neulab, freelancer), each trace ending in task_complete with no
+    # error text on the screen before it; RST GLM-5.3 reward-1 x1; RST GLM-5.3 failure PREFIXES (>= 12 turns,
+    # cut before the wrong done) x1; Bespoke x3. 31,585 rows / 632.2M tokens at 64k; ~151 packed steps per
+    # epoch at 64 x 65,536. Built by data/build_mix_v4.py; the pin is the sha256 of the set's SHA256SUMS.
+    "mix_64k_v4": StageSpec(
+        "conversations",
+        "mix_64k_v4",
+        "s4_mix_64k_v4",
+        1200,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="9ba483210ceddc8c04035862a13149746ea27e42",
+        source_files=1,
+        chat_template=MARIN_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
     "kimi_swesmith": StageSpec(
         "conversations",
         "kimi_swesmith_v1",
