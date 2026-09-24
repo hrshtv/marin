@@ -149,6 +149,11 @@ class GrugTrainerConfig:
     # ("router biases and deferred load-balancing bias updates stayed frozen"); the default
     # re-derives the biases from zero on the SFT data.
     freeze_router_bias: bool = False
+    # Also keep the router WEIGHTS (the expert-logit projection) at their imported values, so expert
+    # assignment stays the base model's and only experts/attention adapt. The gate is the most-moved
+    # family under narrow SFT data (Grug 09.21 run 2: relL2 ~0.1 vs ~3.5e-3 elsewhere). Implies
+    # freeze_router_bias semantics for the bias copy as well.
+    freeze_router_weights: bool = False
     # LR-schedule horizon in steps; None => num_train_steps. Set it LONGER than num_train_steps to train the
     # first part of a longer schedule now (e.g. one epoch of a two-epoch cosine) and resume later on the same
     # output with a larger num_train_steps: the loop picks up this run's own checkpoint (optimizer state and
@@ -459,6 +464,24 @@ def _copy_router_bias(model: Transformer, source: Transformer) -> Transformer:
     return eqx.tree_at(lambda t: t.blocks, model, tuple(new_blocks))
 
 
+def _copy_router_weights(model: Transformer, source: Transformer) -> Transformer:
+    """Return ``model`` with every router weight matrix taken from ``source`` (held frozen)."""
+    if model.stacked_blocks is not None:
+        return eqx.tree_at(
+            lambda t: t.stacked_blocks.stacked.mlp.router,
+            model,
+            source.stacked_blocks.stacked.mlp.router,
+        )
+    assert model.blocks is not None
+    new_blocks = list(model.blocks)
+    for i, (block, src_block) in enumerate(zip(model.blocks, source.blocks, strict=True)):
+        if not isinstance(block, Block) or block.mlp is None:
+            continue
+        new_mlp = eqx.tree_at(lambda m: m.router, block.mlp, src_block.mlp.router)
+        new_blocks[i] = eqx.tree_at(lambda b: b.mlp, block, new_mlp)
+    return eqx.tree_at(lambda t: t.blocks, model, tuple(new_blocks))
+
+
 def initial_state(
     model_config: GrugModelConfig,
     *,
@@ -519,6 +542,7 @@ def _make_train_step(
     watch_config: WatchConfig | None = None,
     tail: "TailSettings | None" = None,
     freeze_router_bias: bool = False,
+    freeze_router_weights: bool = False,
 ):
     one = jnp.array(1, dtype=jnp.int32)
     z_loss = z_loss_weight if z_loss_weight > 0 else None
@@ -591,6 +615,8 @@ def _make_train_step(
         params = optax.apply_updates(qb_params, updates)
         if freeze_router_bias:
             params = _copy_router_bias(params, state.params)
+        if freeze_router_weights:
+            params = _copy_router_weights(params, state.params)
 
         if ema_beta is None:
             ema_params = None
@@ -820,9 +846,12 @@ def run_grug_local(config: GrugRunConfig) -> None:
         watch_config=watch_config if watch_config.is_enabled else None,
         tail=tail,
         freeze_router_bias=config.trainer.freeze_router_bias,
+        freeze_router_weights=config.trainer.freeze_router_weights,
     )
     if config.trainer.freeze_router_bias:
         logger.info("Router biases FROZEN: keeping the imported values, no load-balancing update")
+    if config.trainer.freeze_router_weights:
+        logger.info("Router WEIGHTS FROZEN: expert assignment stays at the imported gate")
 
     data_key, model_key = jax.random.split(jax.random.PRNGKey(trainer.seed), 2)
     if config.trainer.data_seed is not None:

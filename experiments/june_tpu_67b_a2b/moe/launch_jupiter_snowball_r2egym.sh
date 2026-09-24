@@ -97,6 +97,7 @@ steps           = ${STEPS}   (lr schedule over ${SCHEDULE_STEPS} = ${SCHEDULE_EP
 lr              = ${SNOWBALL_LR:-stage default}
 seq_len         = ${SNOWBALL_SEQ_LEN:-32768}  (batch 64; tokens/step scale with it)
 router_bias     = ${SNOWBALL_FREEZE_ROUTER_BIAS:-0}  (1 = frozen at the imported values)
+router_weights  = ${SNOWBALL_FREEZE_ROUTER_WEIGHTS:-0}  (1 = gate projection frozen too)
 keep_every      = ${SNOWBALL_KEEP_EVERY:-1000}  (permanent checkpoint interval)
 tail            = fraction ${SNOWBALL_TAIL_FRACTION:-0} ramp ${SNOWBALL_TAIL_RAMP:-0} ref ${SNOWBALL_TAIL_REF:-none} score_out ${SNOWBALL_TAIL_SCORE_OUT:-none}
 init            = ${INIT}   (required step ${INIT_STEP}, verified)
