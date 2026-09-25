@@ -796,6 +796,26 @@ STAGES: dict[str, StageSpec] = {
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
+    # Run 5r (2026-09-24): the REAL v5 -- v4 plus 1,329 own trajectories of the run-2 export on 374 RTS + 400 ET tasks
+    # (reward 1, clean check within 3 command turns before the first done, no fix in the done turn, parse-failed turns
+    # spliced out, unsplit think blocks re-split; 114 "Are you sure -> kept working -> passed" rows x2), RFT rows x8 =
+    # 14.6 % of 740.3M tokens; ~177 packed steps per epoch. The earlier "mix_64k_v5" stage was built from an empty RFT
+    # slice (converter layout bug) and is v4 data; run 5 on it is the gate-unfrozen control for run 4.
+    "mix_64k_v5r": StageSpec(
+        "conversations",
+        "mix_64k_v5r",
+        "s4_mix_64k_v5r",
+        1200,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="0a51da5c8f4c7603dfa32c3074e59a18d3db7677",
+        source_files=1,
+        chat_template=MARIN_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
     "kimi_swesmith": StageSpec(
         "conversations",
         "kimi_swesmith_v1",
