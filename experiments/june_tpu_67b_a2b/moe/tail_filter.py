@@ -88,6 +88,169 @@ def document_sums(
     return psum(num), psum(den)
 
 
+# A turn carries at most this many spans: the reasoning before the closing think marker, and the action
+# after it. ``span_segment_ids`` emits both so one scoring pass serves the document, turn and span units.
+SPANS_PER_TURN = 2
+
+
+def span_segment_ids(
+    weight: jax.Array,
+    segment_ids: jax.Array,
+    tokens: jax.Array,
+    *,
+    num_docs: int,
+    max_turns: int,
+    end_think_id: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Map every position to a unique ``(document, turn, span)`` id, or ``-1`` where nothing is trained.
+
+    A TURN is a maximal run of supervised positions (loss weight > 0) inside one document: the chat template
+    emits exactly one such run per assistant message, so turns need no extra data. A turn splits into two
+    SPANS at its first ``end_think_id`` — the reasoning up to and including that marker, then the action the
+    model takes. A turn without the marker is all span 0.
+
+    The id is ``(doc * max_turns + turn) * SPANS_PER_TURN + span``, so summing over consecutive id pairs
+    gives the turn and summing over a document's whole block gives the document: one scoring pass at this
+    granularity serves every unit. Returns the ids and the number of positions whose turn index ran past
+    ``max_turns``, which the caller must treat as a hard error rather than silently clamping the tail.
+
+    Runs INSIDE ``jax.shard_map`` on one device's rows, like every other reduction here. It cannot run on
+    the global batch: finding turn boundaries shifts the sequence by one position, and on a batch sharded
+    over the mesh that slice is a sharded-dim slice jax refuses to compile. Locally the shard is an ordinary
+    array, and a document never straddles two rows (the cache row IS the document), so the per-document
+    rebase below is a local reduction with the same answer a global one would give.
+    """
+    w = weight.reshape(-1).astype(jnp.float32)
+    seg = segment_ids.reshape(-1).astype(jnp.int32)
+    # Position ``i`` of the loss scores the TARGET token, which ``levanter.models.loss.next_token_loss``
+    # takes as ``roll(tokens, -1)``. The marker must therefore be matched against the next token id, not the
+    # one sitting at the position; matching in place puts the first action token in the reasoning span.
+    tokens_2d = tokens.astype(jnp.int32)
+    target_2d = jnp.concatenate(
+        [tokens_2d[..., 1:], jnp.full(tokens_2d.shape[:-1] + (1,), -1, dtype=jnp.int32)], axis=-1
+    )
+    tok = target_2d.reshape(-1)
+    supervised = (w > 0) & (seg >= 0)
+    big = jnp.int32(jnp.iinfo(jnp.int32).max)
+
+    # A turn starts at a supervised position whose predecessor is unsupervised or in another document.
+    prev_supervised = jnp.concatenate([jnp.zeros((1,), dtype=bool), supervised[:-1]])
+    prev_seg = jnp.concatenate([jnp.full((1,), -1, dtype=jnp.int32), seg[:-1]])
+    starts = supervised & (~prev_supervised | (seg != prev_seg))
+    # Running turn ordinal over this shard, then rebased per document so it counts within the document.
+    ordinal = jnp.cumsum(starts.astype(jnp.int32)) - 1
+    seg_safe = jnp.where(supervised, seg, 0)
+    doc_base = jax.ops.segment_min(jnp.where(supervised, ordinal, big), seg_safe, num_segments=num_docs)
+    turn_index = ordinal - doc_base[seg_safe]
+    overflow = jnp.sum(jnp.where(supervised, turn_index >= max_turns, False).astype(jnp.int32))
+    turn_index = jnp.clip(turn_index, 0, max_turns - 1)
+    turn_id = seg_safe * max_turns + turn_index
+
+    # Span 1 begins strictly after the turn's first closing think marker; the marker itself stays in span 0.
+    is_end = supervised & (tok == jnp.int32(end_think_id))
+    ends_before = jnp.cumsum(is_end.astype(jnp.int32)) - is_end.astype(jnp.int32)
+    turn_base = jax.ops.segment_min(
+        jnp.where(supervised, ends_before, big), turn_id, num_segments=num_docs * max_turns
+    )
+    span = (ends_before - turn_base[turn_id] > 0).astype(jnp.int32)
+
+    ids = turn_id * SPANS_PER_TURN + span
+    return jnp.where(supervised, ids, -1), overflow
+
+
+TAIL_UNITS = ("document", "turn", "span")
+# ``unit_filtered_loss`` reports everything ``tail_filtered_loss`` does, plus the overflow guard.
+UNIT_STAT_KEYS: tuple[str, ...] = STAT_KEYS + ("tail/turn_overflow",)
+
+
+def unit_segments(unit: str, num_docs: int, max_turns: int) -> int:
+    """How many segments a reference vector carries for ``unit``."""
+    if unit == "document":
+        return num_docs
+    if unit == "turn":
+        return num_docs * max_turns
+    if unit == "span":
+        return num_docs * max_turns * SPANS_PER_TURN
+    raise ValueError(f"unit must be one of {TAIL_UNITS}; got {unit!r}")
+
+
+def unit_segment_ids(
+    weight: jax.Array,
+    segment_ids: jax.Array,
+    tokens: jax.Array,
+    *,
+    unit: str,
+    num_docs: int,
+    max_turns: int,
+    end_think_id: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Flat per-position segment ids for ``unit``, on local shards, plus the turn-overflow count.
+
+    Span ids nest, so the coarser units come from integer division: ``// SPANS_PER_TURN`` gives the turn and
+    a further ``// max_turns`` the document, with ``-1`` padding preserved because floor division keeps it.
+    """
+    if unit == "document":
+        return segment_ids.reshape(-1).astype(jnp.int32), jnp.int32(0)
+    span_ids, overflow = span_segment_ids(
+        weight, segment_ids, tokens, num_docs=num_docs, max_turns=max_turns, end_think_id=end_think_id
+    )
+    if unit == "span":
+        return span_ids, overflow
+    if unit == "turn":
+        return jnp.floor_divide(span_ids, SPANS_PER_TURN), overflow
+    raise ValueError(f"unit must be one of {TAIL_UNITS}; got {unit!r}")
+
+
+def unit_sums(
+    per_pos: jax.Array,
+    weight: jax.Array,
+    segment_ids: jax.Array,
+    tokens: jax.Array,
+    *,
+    unit: str,
+    num_docs: int,
+    max_turns: int,
+    end_think_id: int,
+    psum: PsumFn = _identity,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``(loss sum, weight sum, overflow)`` per segment of ``unit`` — the scoring pass's reduction."""
+    ids, overflow = unit_segment_ids(
+        weight, segment_ids, tokens, unit=unit, num_docs=num_docs, max_turns=max_turns, end_think_id=end_think_id
+    )
+    num, den = document_sums(per_pos, weight, ids, unit_segments(unit, num_docs, max_turns), psum=psum)
+    return num, den, psum(overflow)
+
+
+def unit_filtered_loss(
+    per_pos: jax.Array,
+    weight: jax.Array,
+    segment_ids: jax.Array,
+    tokens: jax.Array,
+    ref_loss: jax.Array,
+    fraction: jax.Array | float,
+    *,
+    unit: str,
+    num_docs: int,
+    max_turns: int,
+    end_think_id: int,
+    psum: PsumFn = _identity,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """``tail_filtered_loss`` with the filter's unit chosen by ``unit`` rather than fixed to the document."""
+    ids, overflow = unit_segment_ids(
+        weight, segment_ids, tokens, unit=unit, num_docs=num_docs, max_turns=max_turns, end_think_id=end_think_id
+    )
+    doc_num, doc_den = document_sums(per_pos, weight, ids, ref_loss.shape[0], psum=psum)
+    keep, stats = tail_keep_mask(doc_num, doc_den, ref_loss, fraction)
+    loss, unfiltered, kept_frac = filtered_mean(per_pos, weight, ids, keep, psum=psum)
+    stats = dict(stats)
+    stats["tail/loss_unfiltered"] = jax.lax.stop_gradient(unfiltered)
+    stats["tail/kept_token_frac"] = jax.lax.stop_gradient(kept_frac)
+    stats["tail/fraction"] = jnp.asarray(fraction, dtype=jnp.float32)
+    stats["tail/turn_overflow"] = jax.lax.stop_gradient(psum(overflow).astype(jnp.float32))
+    assert tuple(stats) == UNIT_STAT_KEYS, (tuple(stats), UNIT_STAT_KEYS)
+    return loss, stats
+
+
 def tail_keep_mask(
     doc_num: jax.Array,
     doc_den: jax.Array,
@@ -110,10 +273,12 @@ def tail_keep_mask(
     m = jnp.sum(scorable).astype(jnp.int32)
     k = jnp.floor(jnp.asarray(fraction, dtype=jnp.float32) * m.astype(jnp.float32)).astype(jnp.int32)
     k = jnp.clip(k, 0, jnp.maximum(m - 1, 0))  # never drop every scorable document
-    ordered = jnp.sort(margin)  # +inf (not scorable) sorts last
-    kth = ordered[jnp.clip(k - 1, 0, num_docs - 1)]
+    order = jnp.argsort(margin, stable=True)  # +inf (not scorable) sorts last
+    ranks = jnp.zeros(num_docs, dtype=jnp.int32).at[order].set(jnp.arange(num_docs, dtype=jnp.int32))
+    kth = margin[order[jnp.clip(k - 1, 0, num_docs - 1)]]
     thresh = jnp.where(k > 0, kth, -jnp.inf)
-    drop = scorable & (margin <= thresh) & (k > 0)
+    # A threshold alone drops every tied example, potentially erasing the entire batch's gradient.
+    drop = scorable & (ranks < k)
     keep = jnp.logical_not(drop)
     n_scorable = jnp.maximum(m, 1).astype(jnp.float32)
     stats = {

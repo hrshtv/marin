@@ -61,6 +61,16 @@ from experiments.june_tpu_67b_a2b.moe.train import (
     run_grug_local,
 )
 from experiments.marin_tokenizer import MARIN_CHAT_TEMPLATE
+
+# The Grug 09.21 base model's own chat template (tokenizer_config.json of the released checkpoint; it already carries
+# Levanter's {% generation %} markers). Used for every MiniSweAgent-format stage so training renders tools, tool calls,
+# reasoning and the "Reasoning: /think" header byte-identically to vLLM at serving.
+# Path of that template file: required, set by the cluster settings (no machine-specific default here).
+GRUG0921_CHAT_TEMPLATE_PATH = os.environ.get("GRUG0921_CHAT_TEMPLATE_PATH")
+if not GRUG0921_CHAT_TEMPLATE_PATH:
+    raise RuntimeError("set GRUG0921_CHAT_TEMPLATE_PATH to the Grug 09.21 base model's chat_template.jinja")
+with open(GRUG0921_CHAT_TEMPLATE_PATH, encoding="utf-8") as _f:
+    GRUG0921_CHAT_TEMPLATE = _f.read()
 from experiments.sft.delphi_chat_template import DELPHI_V0_CHAT_TEMPLATE
 
 _MINIMUM_OUTPUT_FREE_BYTES = 1_000_000_000_000
@@ -816,6 +826,95 @@ STAGES: dict[str, StageSpec] = {
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
+    # Run 6 (2026-09-26): allenai/tmax-sft success trajectories in MiniSweAgent format (OpenAI tool calls, reasoning_content,
+    # tool observations), rows ≤32k tokens (see census.json), teacher Qwen 3.6 27B. Rows carry
+    # chat_template_kwargs={"tools": [...]} so the BASE model's own template (never the Marin one) renders the `### Tools`
+    # header, `<tool_call>` blocks and `<tool_response name="bash">` exactly as vLLM does for our agent. Parity: Levanter ids ==
+    # HF apply_chat_template(tools=...) on 60/60 sampled rows, loss mask = assistant turns only. Built by data/build_tmax_msa_v1.py.
+    "tmax_msa_v1": StageSpec(
+        "messages",
+        "tmax_msa_v1",
+        "s4_tmax_msa_v1",
+        400,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="cdc570c9489aaccff2956b7339a226e2b8da0510",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
+    # Run 7 (2026-09-26): v7 = tmax-sft successes (5,324 rows / 37.0M tok) + the base model's OWN MiniSweAgent RFT
+    # successes on the ET+RTS pool (977 rows / 8.1M tok = 17.9 %, <=2 per task, reward 1, ends in submit, no grader
+    # leakage, format-error turns spliced). 6,301 rows / 45.0M tok / 21.5 packed steps per epoch. Base chat template.
+    "mix_v7": StageSpec(
+        "messages",
+        "mix_v7",
+        "s4_mix_v7",
+        1400,  # ceiling: 400 -> 600 for the 20-epoch (440-step) tracking-rule runs, -> 1400 for 40/60 epochs, 2026-10-09
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="b9d5b6d107fe2507ed20d73c96c17a50555e485d",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
+    # mix_v8: same sources as mix_v7, more of the model's own RFT successes per task (cap 4: 6,915 rows / 50.0M tok, RFT 1,591 rows = 26.1 %).
+    "mix_v8": StageSpec(
+        "messages",
+        "mix_v8",
+        "s4_mix_v8",
+        400,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="6e477178279d9e3ac150b5bb82386f461e46f244",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
+    # mix_v9: same sources as mix_v7, more of the model's own RFT successes per task (cap 8 (no cap): 7,363 rows / 53.6M tok, RFT 2,039 rows = 31.1 %).
+    "mix_v9": StageSpec(
+        "messages",
+        "mix_v9",
+        "s4_mix_v9",
+        400,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="2faa2ab4f2b647fed0ea705262b2354bb6bab56a",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
+    # mix_v11: byte-identical to mix_v9 except that every tool-calling assistant turn renders a CLOSED think block
+    # (6,724 teacher turns arrived with empty reasoning and the template then omitted the markers entirely, the one
+    # inconsistency in the protocol; the model opens a block on every turn at inference and fails to close it on 4-5 %
+    # of them, which costs 16-21 % of trials to the 3-format-error stop). 0 rows and 0 tokens lost by the fill.
+    "mix_v11": StageSpec(
+        "messages",
+        "mix_v11",
+        "s4_mix_v11",
+        400,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="4111239263ec5576135236ce37e58ab361f5fb69",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
     "kimi_swesmith": StageSpec(
         "conversations",
         "kimi_swesmith_v1",
@@ -828,6 +927,61 @@ STAGES: dict[str, StageSpec] = {
         dataset_revision="1b87a9cf78b897a2355105d47afd44d818cad25d",
         source_files=1,
         chat_template=MARIN_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
+    # Same Kimi SWE-smith parquet, but tokenized with the 0921 base template (the rule for every stage trained from
+    # the 0921 checkpoint, see run7's mix_v7) instead of the Marin template, and a ceiling wide enough for ten
+    # passes (~33 steps each at 32k x 64). Used for the plain-vs-tracking-rule comparison on SWE data.
+    "kimi_swesmith_g0921": StageSpec(
+        "conversations",
+        "kimi_swesmith_v1",
+        "s4_kimi_swesmith_g0921",
+        1400,  # ceiling 400 -> 1400 for the 20-pass (640-step) tracking-rule run, 2026-10-10
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="1b87a9cf78b897a2355105d47afd44d818cad25d",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
+    # nvidia/Open-SWE-Traces v1.2 mini-swe-agent split (Qwen3.8-27B, thinking, reasoning_effort xhigh), RESOLVED rows only,
+    # converted to our MiniSweAgent harness layout (our system prompt, one bash call per turn with multi-call turns merged,
+    # observations as `<output>\n\n(exit_code=N)`, bare submit marker) by data/sft/openswe_v12_msa/code/build_openswe_msa.py;
+    # rows > 65,000 tokens under the 0921 template dropped. Train at SNOWBALL_SEQ_LEN=65536. Ceiling wide enough for
+    # 20 passes of a ~5k-row subset.
+    "openswe_v12_msa_g0921": StageSpec(
+        "messages",
+        "openswe_v12_msa",
+        "s4_openswe_v12_msa",
+        4000,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="e192b26a43b8d09f156eeee781aef8e6bd5108ba",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
+    # mix_v7 (45M tok) + openswe_v12_msa (319M tok) concatenated into one parquet (data/sft/openswe_mixv7), no reweighting;
+    # 364M tokens, ~87 steps per pass at 64k x 64. For the combined-data plateau-dropping vs plain runs, 2026-10-10.
+    "openswe_mixv7_g0921": StageSpec(
+        "messages",
+        "openswe_mixv7",
+        "s4_openswe_mixv7",
+        4000,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="local-concat-mixv7-b9d5b6d1-openswe-e192b26a-20261010",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
@@ -1118,7 +1272,10 @@ def snowball_chat_run_config(
         keep_every = full_epoch_steps
     keep_every = keep_every or 1000
     print(f"checkpoint_keep_every={keep_every}", flush=True)
+    # Levanter's run log and profiles default to ./logs under the code tree; SNOWBALL_LOG_DIR moves them to scratch
+    # (the project filesystem is at its inode quota and refuses new files).
     trainer = TrainerConfig(
+        log_dir=Path(os.environ.get("SNOWBALL_LOG_DIR", "logs/")),
         id=run_id,
         seed=SNOWBALL_CHAT_SEED,
         train_batch_size=SNOWBALL_CHAT_BATCH_SIZE,
@@ -1162,12 +1319,45 @@ def snowball_chat_run_config(
     tail_ref = os.environ.get("SNOWBALL_TAIL_REF") or None
     tail_ramp = int(os.environ.get("SNOWBALL_TAIL_RAMP") or 0)
     tail_score_out = os.environ.get("SNOWBALL_TAIL_SCORE_OUT") or None
+    # SNOWBALL_TAIL_UNIT picks what the filter keeps or drops as one unit: the whole cache row ("document",
+    # the paper's unit), one assistant message ("turn"), or a message split at its closing think marker into
+    # the reasoning and the action that follows ("span"). The finer units need SNOWBALL_TAIL_MAX_TURNS, the
+    # cache's true maximum turns per document; the scoring pass always records at span granularity, because
+    # spans roll up into turns and turns into documents.
+    tail_unit = os.environ.get("SNOWBALL_TAIL_UNIT") or "document"
+    tail_max_turns = int(os.environ.get("SNOWBALL_TAIL_MAX_TURNS") or 0)
+    tail_end_think_id = int(os.environ.get("SNOWBALL_TAIL_END_THINK_ID") or 128003)
+    tail_token_dump = os.environ.get("SNOWBALL_TAIL_TOKEN_DUMP") or None
+    # Clip SFT (token_clip.py): SNOWBALL_CLIP_P_HI / SNOWBALL_CLIP_P_LO are probabilities in (0, 1);
+    # SNOWBALL_CLIP_RANDOM_FRAC drops trained tokens at random instead (the control). Unset = off.
+    clip_p_hi = float(os.environ["SNOWBALL_CLIP_P_HI"]) if os.environ.get("SNOWBALL_CLIP_P_HI") else None
+    clip_p_lo = float(os.environ["SNOWBALL_CLIP_P_LO"]) if os.environ.get("SNOWBALL_CLIP_P_LO") else None
+    clip_random_frac = float(os.environ.get("SNOWBALL_CLIP_RANDOM_FRAC") or 0.0)
+    clip_seed = int(os.environ.get("SNOWBALL_CLIP_SEED") or 0)
+    clip_start_step = int(os.environ.get("SNOWBALL_CLIP_START_STEP") or 0)
+    clip_on = clip_p_hi is not None or clip_p_lo is not None or clip_random_frac > 0
+    # Per-token tracking (token_track.py): SNOWBALL_TRACK_TOL > 0 switches it on.
+    track_tol = float(os.environ.get("SNOWBALL_TRACK_TOL") or 0.0)
+    track_floor = float(os.environ.get("SNOWBALL_TRACK_FLOOR") or 0.05)
+    track_max_len = int(os.environ.get("SNOWBALL_TRACK_MAX_LEN") or SNOWBALL_CHAT_SEQUENCE_LENGTH)
+    track_ema_alpha = float(os.environ.get("SNOWBALL_TRACK_EMA_ALPHA") or 0.0)
+    track_reenter = os.environ.get("SNOWBALL_TRACK_REENTER") or "either"
+    track_drop_weight = float(os.environ.get("SNOWBALL_TRACK_DROP_WEIGHT") or 0.0)
+    # SNOWBALL_TRACK_OBSERVE_ONLY=1: record per-token histories (and a trace) without dropping anything (plain SFT).
+    track_observe_only = os.environ.get("SNOWBALL_TRACK_OBSERVE_ONLY", "0") == "1"
+    # SNOWBALL_TRACE_DOCS > 0: token trace of that many randomly chosen documents into SNOWBALL_TRACE_OUT.
+    trace_num_docs = int(os.environ.get("SNOWBALL_TRACE_DOCS") or 0)
+    trace_seed = int(os.environ.get("SNOWBALL_TRACE_SEED") or 0)
+    trace_out = os.environ.get("SNOWBALL_TRACE_OUT") or None
+    track_on = track_tol > 0 or track_observe_only
     # SNOWBALL_SCHEDULE_STEPS: the lr-schedule horizon when it is longer than this run's steps (train one epoch of
     # a two-epoch cosine now, resume to the second later on the same output; train.py GrugTrainerConfig).
     schedule_steps = int(os.environ.get("SNOWBALL_SCHEDULE_STEPS") or 0) or None
     if schedule_steps is not None and schedule_steps < steps:
         raise ValueError(f"SNOWBALL_SCHEDULE_STEPS={schedule_steps} is shorter than the run's {steps} steps")
-    tail_num_docs = read_chat_cache_examples(data_cache_path) if (tail_fraction > 0 or tail_score_out) else None
+    tail_num_docs = (
+        read_chat_cache_examples(data_cache_path) if (tail_fraction > 0 or tail_score_out or clip_on or track_on) else None
+    )
     if tail_score_out and steps < full_epoch_steps:
         raise ValueError(
             f"the TailSFT scoring pass needs at least one packed epoch of batches ({full_epoch_steps} steps); "
@@ -1193,11 +1383,32 @@ def snowball_chat_run_config(
             tail_ramp_steps=tail_ramp,
             tail_num_docs=tail_num_docs,
             tail_score_out=tail_score_out,
+            tail_unit=tail_unit,
+            tail_max_turns=tail_max_turns,
+            tail_end_think_id=tail_end_think_id,
+            tail_token_dump=tail_token_dump,
+            clip_p_hi=clip_p_hi,
+            clip_p_lo=clip_p_lo,
+            clip_random_frac=clip_random_frac,
+            clip_seed=clip_seed,
+            clip_start_step=clip_start_step,
+            track_tol=track_tol,
+            track_floor=track_floor,
+            track_max_len=track_max_len,
+            track_ema_alpha=track_ema_alpha,
+            track_reenter=track_reenter,
+            track_drop_weight=track_drop_weight,
+            track_observe_only=track_observe_only,
+            trace_num_docs=trace_num_docs,
+            trace_seed=trace_seed,
+            trace_out=trace_out,
             # SNOWBALL_FREEZE_ROUTER_BIAS=1 keeps the imported router biases fixed (the Grug 09.21 SFT recipe).
             freeze_router_bias=os.environ.get("SNOWBALL_FREEZE_ROUTER_BIAS", "0") == "1",
             # SNOWBALL_FREEZE_ROUTER_WEIGHTS=1 also pins the gate projection (run 3 onward).
             freeze_router_weights=os.environ.get("SNOWBALL_FREEZE_ROUTER_WEIGHTS", "0") == "1",
             schedule_steps=schedule_steps,
+            # SNOWBALL_DATA_SEED reorders the training data (a second training run of the same recipe); unset keeps seed 0.
+            data_seed=int(os.environ["SNOWBALL_DATA_SEED"]) if os.environ.get("SNOWBALL_DATA_SEED") else None,
         ),
         eval=None,
     )

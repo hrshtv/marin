@@ -37,6 +37,10 @@ OUTPUT = os.environ.get(
 # tokenizer (sha256 881c9c36...), verified on Vista; a local path avoids needing
 # the network from a compute node.
 TOKENIZER = os.environ.get("SNOWBALL_EXPORT_TOKENIZER", "marin-community/marin-tokenizer")
+# Chat template written into the export. Default: the Marin template (runs 1-5r). SNOWBALL_EXPORT_CHAT_TEMPLATE=<path to a
+# .jinja file> selects another one, e.g. the base model's own template so tool calls / reasoning render exactly as at serving.
+_template_path = os.environ.get("SNOWBALL_EXPORT_CHAT_TEMPLATE")
+EXPORT_CHAT_TEMPLATE = open(_template_path).read() if _template_path else MARIN_CHAT_TEMPLATE
 # One GPU per host means the params cannot be replicated: 134 GB bf16 exceeds a
 # 120 GB GH200. Shard over an explicit expert axis instead.
 EXPERT_AXIS = int(os.environ.get("SNOWBALL_EXPORT_EXPERT_AXIS", "1"))
@@ -118,7 +122,10 @@ with set_mesh(mesh):
         config=main_config,
     )
     tokenizer = load_tokenizer(TOKENIZER)
-    converter = main_config.hf_checkpoint_converter().replaced(tokenizer=tokenizer).with_config_overrides({"dtype": "bfloat16"})
+    # max_position_embeddings in the export must be the BASE model's native window (262,144 for Grug 09.21), not the training
+    # packing length: RoPE is unchanged by SFT and vLLM refuses --max-model-len above this value (run 6 exported 32,768).
+    _max_pos = int(os.environ.get("SNOWBALL_EXPORT_MAX_POSITION", "262144"))
+    converter = main_config.hf_checkpoint_converter().replaced(tokenizer=tokenizer).with_config_overrides({"dtype": "bfloat16", "max_position_embeddings": _max_pos})
     converter.save_pretrained(
         export_model,
         OUTPUT,
@@ -128,6 +135,6 @@ with set_mesh(mesh):
             "eos_token_id": [128001, 128009],
             "pad_token_id": 128001,
         },
-        chat_template=MARIN_CHAT_TEMPLATE,
+        chat_template=EXPORT_CHAT_TEMPLATE,
     )
 print("SNOWBALL_EXPORT_OK", flush=True)

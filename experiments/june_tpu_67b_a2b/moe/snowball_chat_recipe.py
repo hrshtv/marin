@@ -39,6 +39,9 @@ BASE_MODELS = {
     # settings are otherwise identical). Its tokenizer.json differs from Snowball's only in
     # naming the reserved ids 128005/128011 `<tool_call>`/`</tool_call>`.
     "grug0921": BaseModel("grug0921", 1.75, "6a61ca2105a54e9984169b409581f31cc50330d1b47104af13c221b05e462e45"),
+    # open-athena/Grug-67B-A2B-Antidoom-RLVR1-Step12-2026.10.02 (sha 88f4d8b8): the Antidoom RLVR1 policy at optimizer step 12.
+    # Same architecture, qk_mult 1.75, chat template and tokenizer.json as 09.21 (byte-identical), so every 09.21 cache is reusable.
+    "grug1002": BaseModel("grug1002", 1.75, "6a61ca2105a54e9984169b409581f31cc50330d1b47104af13c221b05e462e45"),
 }
 BASE_MODEL_ENV = "SNOWBALL_BASE_MODEL"
 
