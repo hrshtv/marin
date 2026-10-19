@@ -61,6 +61,7 @@ from experiments.june_tpu_67b_a2b.moe.train import (
     run_grug_local,
 )
 from experiments.marin_tokenizer import MARIN_CHAT_TEMPLATE
+from experiments.plateau_dropping_qwen.qwen3_template import QWEN3_THINK_TOOLS_TEMPLATE
 
 # The Grug 09.21 base model's own chat template (tokenizer_config.json of the released checkpoint; it already carries
 # Levanter's {% generation %} markers). Used for every MiniSweAgent-format stage so training renders tools, tool calls,
@@ -965,6 +966,27 @@ STAGES: dict[str, StageSpec] = {
         dataset_revision="e192b26a43b8d09f156eeee781aef8e6bd5108ba",
         source_files=1,
         chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
+    # The same Open-SWE v1.2 mini-swe-agent parquet (same messages field, same pinned revision), rendered with Qwen3-8B's
+    # stock chat template plus {% generation %} markers (experiments/plateau_dropping_qwen/qwen3_template.py) for the
+    # Levanter Qwen3-8B trainer (experiments/plateau_dropping_qwen/qwen_sft.py). Build the cache with the Qwen3
+    # tokenizer and train at SNOWBALL_SEQ_LEN=32768. The parquet cuts rows longer than 32,768 tokens at a turn boundary
+    # (longest prefix of complete turns ending on an assistant turn), so every document fits one row whole: the packer
+    # never splits or truncates a document of <= 32,768 tokens (data_path_test.py).
+    "openswe_v12_msa_qwen3_32k": StageSpec(
+        "messages",
+        "openswe_v12_msa_qwen3",
+        "s4_openswe_v12_msa_qwen3",
+        4000,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="e192b26a43b8d09f156eeee781aef8e6bd5108ba",
+        source_files=1,
+        chat_template=QWEN3_THINK_TOOLS_TEMPLATE,
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
