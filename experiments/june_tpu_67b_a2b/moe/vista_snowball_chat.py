@@ -990,6 +990,23 @@ STAGES: dict[str, StageSpec] = {
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
+    # The same rendering cut at 65,536 tokens instead (turn-boundary truncation, build --max-tokens 65536 --truncate), for
+    # Qwen3 models with a native context of 256k (Qwen3-30B-A3B-Thinking-2507); train at SNOWBALL_SEQ_LEN=65536.
+    "openswe_v12_msa_qwen3_64k": StageSpec(
+        "messages",
+        "openswe_v12_msa_qwen3",
+        "s4_openswe_v12_msa_qwen3",
+        4000,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="e192b26a43b8d09f156eeee781aef8e6bd5108ba",
+        source_files=1,
+        chat_template=QWEN3_THINK_TOOLS_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
     # mix_v7 (45M tok) + openswe_v12_msa (319M tok) concatenated into one parquet (data/sft/openswe_mixv7), no reweighting;
     # 364M tokens, ~87 steps per pass at 64k x 64. For the combined-data plateau-dropping vs plain runs, 2026-10-10.
     "openswe_mixv7_g0921": StageSpec(

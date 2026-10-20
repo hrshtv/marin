@@ -560,12 +560,28 @@ def trainer_mesh_config():
     )
 
 
-def qwen_model_config(hf_config, *, attn_backend: str, flash_block_size: int | None, gradient_checkpointing: bool):
-    """Levanter ``Qwen3Config`` from the HF config (``use_hf_model_config`` semantics) plus runtime knobs."""
-    from levanter.layers.attention import AttentionBackend  # noqa: PLC0415
+def levanter_config_class(model_type: str):
+    """Levanter config class for an HF ``model_type``: dense Qwen3, or Qwen3-MoE (e.g. Qwen3-30B-A3B, dropless routing)."""
     from levanter.models.qwen import Qwen3Config  # noqa: PLC0415
+    from levanter.models.qwen3_moe import Qwen3MoeConfig  # noqa: PLC0415
 
-    cfg = Qwen3Config.from_hf_config(hf_config)
+    classes = {"qwen3": Qwen3Config, "qwen3_moe": Qwen3MoeConfig}
+    if model_type not in classes:
+        raise ValueError(f"unsupported model_type {model_type!r}; expected one of {sorted(classes)}")
+    return classes[model_type]
+
+
+def hf_model_type(hf_checkpoint: str) -> str:
+    return json.loads((Path(hf_checkpoint) / "config.json").read_text())["model_type"]
+
+
+def qwen_model_config(hf_config, *, attn_backend: str, flash_block_size: int | None, gradient_checkpointing: bool):
+    """Levanter ``Qwen3Config`` / ``Qwen3MoeConfig`` from the HF config (``use_hf_model_config`` semantics) plus
+    runtime knobs. For MoE the router load-balancing loss (HF ``router_aux_loss_coef``, 0.001) is added to every
+    position's loss by Levanter, so it is part of the objective and of the tracked per-token loss alike."""
+    from levanter.layers.attention import AttentionBackend  # noqa: PLC0415
+
+    cfg = levanter_config_class(hf_config.model_type).from_hf_config(hf_config)
     return dataclasses.replace(
         cfg,
         attn_backend=AttentionBackend(attn_backend),
@@ -576,10 +592,9 @@ def qwen_model_config(hf_config, *, attn_backend: str, flash_block_size: int | N
 
 def make_converter(hf_checkpoint: str, tokenizer_path: str, *, pad_to_model: bool = True):
     """The HF converter for ``hf_checkpoint`` with the run's tokenizer, padded to the model vocab (151,936)."""
-    from levanter.models.qwen import Qwen3Config  # noqa: PLC0415
     from levanter.tokenizers import load_tokenizer  # noqa: PLC0415
 
-    converter = Qwen3Config().hf_checkpoint_converter(ref_checkpoint=hf_checkpoint)
+    converter = levanter_config_class(hf_model_type(hf_checkpoint))().hf_checkpoint_converter(ref_checkpoint=hf_checkpoint)
     converter = converter.replaced(reference_checkpoint=hf_checkpoint, tokenizer=load_tokenizer(tokenizer_path))
     if pad_to_model:
         converter = converter.with_tokenizer_padded_to_match_model()
@@ -1156,8 +1171,8 @@ def run_preflight(cfg: QwenSftConfig, *, expect_devices: int | None = None, chec
     # HF checkpoint.
     hf_dir = Path(cfg.hf_checkpoint)
     hf_cfg = json.loads((hf_dir / "config.json").read_text())
-    if hf_cfg.get("model_type") != "qwen3":
-        raise ValueError(f"{hf_dir} is a {hf_cfg.get('model_type')!r} checkpoint, expected qwen3")
+    if hf_cfg.get("model_type") not in ("qwen3", "qwen3_moe"):
+        raise ValueError(f"{hf_dir} is a {hf_cfg.get('model_type')!r} checkpoint, expected qwen3 or qwen3_moe")
     weights = list(hf_dir.glob("*.safetensors")) + list(hf_dir.glob("pytorch_model*.bin"))
     if not weights:
         raise FileNotFoundError(f"{hf_dir} has no weight files")
