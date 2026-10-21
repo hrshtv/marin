@@ -1193,7 +1193,8 @@ class HFCheckpointConverter(Generic[LevConfig]):
                     humanfriendly.format_size(bytes_this_time),
                     100 * bytes_this_time / model_size,
                 )
-                save_state_dict(shard_numpy, os.path.join(local_path, shard_name))
+                if jax.process_index() == 0:  # every process gathers; only one writes (shared filesystem race otherwise)
+                    save_state_dict(shard_numpy, os.path.join(local_path, shard_name))
 
                 _maybe_upload(
                     local_path,
@@ -1218,29 +1219,35 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
             if save_reference_code_flag:
                 logger.info(f"Copying reference code from {self.reference_checkpoint}")
-                self._save_code_local(local_path)
+                if jax.process_index() == 0:  # every process gathers; only one writes (shared filesystem race otherwise)
+                    self._save_code_local(local_path)
 
             if save_tokenizer:
                 logger.info("Saving tokenizer")
-                _save_tokenizer_pretrained(self.tokenizer, local_path, chat_template=chat_template)
+                if jax.process_index() == 0:  # every process gathers; only one writes (shared filesystem race otherwise)
+                    _save_tokenizer_pretrained(self.tokenizer, local_path, chat_template=chat_template)
 
             if save_feature_extractor and self.feature_extractor is not None:
                 logger.info("Saving feature extractor")
-                self.feature_extractor.save_pretrained(local_path)
+                if jax.process_index() == 0:  # every process gathers; only one writes (shared filesystem race otherwise)
+                    self.feature_extractor.save_pretrained(local_path)
 
-            with open(os.path.join(local_path, "config.json"), "w") as f:
-                json.dump(dict_config, f)
+            if jax.process_index() == 0:  # every process gathers; only one writes (shared filesystem race otherwise)
+                with open(os.path.join(local_path, "config.json"), "w") as f:
+                    json.dump(dict_config, f)
 
             if generation_config is not None:
                 logger.info(
                     "Writing generation_config.json with eos_token_id=%s", generation_config.get("eos_token_id")
                 )
-                with open(os.path.join(local_path, "generation_config.json"), "w") as f:
-                    json.dump(generation_config, f)
+                if jax.process_index() == 0:  # every process gathers; only one writes (shared filesystem race otherwise)
+                    with open(os.path.join(local_path, "generation_config.json"), "w") as f:
+                        json.dump(generation_config, f)
 
             if index is not None:
-                with open(os.path.join(local_path, SAFE_TENSORS_INDEX_NAME), "w") as f:
-                    json.dump(index, f)
+                if jax.process_index() == 0:  # every process gathers; only one writes (shared filesystem race otherwise)
+                    with open(os.path.join(local_path, SAFE_TENSORS_INDEX_NAME), "w") as f:
+                        json.dump(index, f)
 
             files_after = _list_relative_files(local_path)
             new_files = sorted(files_after - files_before)
