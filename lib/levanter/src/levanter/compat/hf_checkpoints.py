@@ -1193,8 +1193,9 @@ class HFCheckpointConverter(Generic[LevConfig]):
                     humanfriendly.format_size(bytes_this_time),
                     100 * bytes_this_time / model_size,
                 )
-                if jax.process_index() == 0:  # every process gathers; only one writes (shared filesystem race otherwise)
-                    save_state_dict(shard_numpy, os.path.join(local_path, shard_name))
+                # save_state_dict syncs all processes (sync_global_devices) and writes from process 0 itself: every
+                # process must call it (gating it on process 0 deadlocked the 4-rank Grug export, Horizon job 64274).
+                save_state_dict(shard_numpy, os.path.join(local_path, shard_name))
 
                 _maybe_upload(
                     local_path,
