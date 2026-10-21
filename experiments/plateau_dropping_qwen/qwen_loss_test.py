@@ -118,7 +118,7 @@ def test_per_position_loss_is_grugs_quantity(setup):
     """(CE + z * logsumexp^2) * weight, computed by Grug's fused loss on the same hidden states."""
     model, example = setup["model"], setup["example"]
     with set_mesh(setup["mesh"]), hax.axis_mapping(setup["param_map"]):
-        pp = qs.per_position_loss(model, example, mp=MP, z_loss_weight=Z, compute_mapping=setup["compute_map"])
+        pp, _aux = qs.per_position_loss(model, example, mp=MP, z_loss_weight=Z, compute_mapping=setup["compute_map"])
 
         @jax.jit
         def hidden_and_head(model, example):
@@ -147,7 +147,7 @@ def test_per_position_loss_is_grugs_quantity(setup):
     assert np.all(w[:, -1] == 0)
     # the z-loss term is in it: without it the per-position loss is smaller
     with set_mesh(setup["mesh"]), hax.axis_mapping(setup["param_map"]):
-        pp0 = qs.per_position_loss(model, example, mp=MP, z_loss_weight=0.0, compute_mapping=setup["compute_map"])
+        pp0, _aux0 = qs.per_position_loss(model, example, mp=MP, z_loss_weight=0.0, compute_mapping=setup["compute_map"])
     assert np.all(np.asarray(pp.array)[w > 0] > np.asarray(pp0.array)[w > 0])
 
 

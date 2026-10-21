@@ -315,18 +315,31 @@ def effective_loss_weight(example):
 
 
 def per_position_loss(model, example, *, mp, z_loss_weight: float, compute_mapping=None):
-    """``(B, S)`` float32 per-position loss, z-loss included, times the effective weight.
+    """``(pp, aux)``: the ``(B, S)`` float32 per-position loss, z-loss included, times the effective weight, and the
+    model's scalar auxiliary loss (the MoE router load-balancing loss of Qwen3-MoE; 0 for dense Qwen3).
 
-    The same quantity as Grug's ``next_token_loss(..., reduction="none", logsumexp_weight=z_loss)``:
-    ``(CE + z * logsumexp^2) * weight``, zero where the weight is zero.
+    ``pp`` is the same quantity as Grug's ``next_token_loss(..., reduction="none", logsumexp_weight=z_loss)``:
+    ``(CE + z * logsumexp^2) * weight``, zero where the weight is zero. The aux loss is returned separately so that
+    ``objective`` adds it once; ``LmHeadModel.compute_next_token_loss(reduction=None)`` instead broadcasts it onto
+    every position, which would put it into the per-token tracked losses and into ``sum(pp) / sum(weight)`` for
+    every unweighted position too (the bug before 2026-10-21).
     """
     import haliax as hax  # noqa: PLC0415
+    import jax.numpy as jnp  # noqa: PLC0415
+    from levanter.models.lm_model import split_activations  # noqa: PLC0415
+    from levanter.models.loss import maybe_fused_next_token_loss  # noqa: PLC0415
 
     z_loss = z_loss_weight if z_loss_weight > 0 else None
     with hax.axis_mapping(compute_mapping) if compute_mapping is not None else _nullcontext():
         compute_model = mp.cast_to_compute(model)
-        pp = compute_model.compute_next_token_loss(example, key=None, reduction=None, logsumexp_weight=z_loss)
-    return pp
+        activations, aux = split_activations(compute_model.activations(example.tokens, example.attn_mask, key=None))
+        pp = maybe_fused_next_token_loss(
+            compute_model.Pos, compute_model.Embed, compute_model.Vocab, activations, compute_model.get_lm_head(),
+            example.tokens, loss_weight=example.loss_weight, reduction=None, reduction_axis=None,
+            logsumexp_weight=z_loss, dtype=jnp.float32, logit_soft_cap=None,
+        )
+    aux = jnp.asarray(aux.array if isinstance(aux, hax.NamedArray) else aux, dtype=jnp.float32)
+    return pp, aux
 
 
 class _nullcontext:
@@ -347,8 +360,9 @@ def track_kwargs(settings) -> dict[str, Any]:
     )
 
 
-def objective(per_pos, weight, hist, settings):
-    """``(loss, metrics)`` from the per-position loss: Grug's plain token mean, or ``tracked_loss`` unchanged.
+def objective(per_pos, weight, hist, settings, aux=0.0):
+    """``(loss, metrics)`` from the per-position loss: Grug's plain token mean, or ``tracked_loss`` unchanged, plus
+    the model's scalar auxiliary loss ``aux`` (added once; it never enters the per-token statistics).
 
     ``per_pos`` / ``weight`` / ``hist`` are raw ``(B, S)`` arrays (``hist`` = prev1, prev2, count, prev_dropped).
     """
@@ -360,11 +374,13 @@ def objective(per_pos, weight, hist, settings):
         num = jnp.sum(per_pos.astype(jnp.float32))
         den = jnp.sum(weight.astype(jnp.float32))
         loss = jnp.where(den != 0, num / jnp.where(den != 0, den, 1.0), jnp.zeros_like(den))
-        return loss, {"train/cross_entropy_loss": loss}
-    loss, stats = token_track.tracked_loss(per_pos, weight, *hist, **track_kwargs(settings))
-    metrics = {"train/cross_entropy_loss": stats["track/loss_unfiltered"]}
-    metrics.update({f"train/{k}": v for k, v in stats.items()})
-    return loss, metrics
+        metrics = {"train/cross_entropy_loss": loss}
+    else:
+        loss, stats = token_track.tracked_loss(per_pos, weight, *hist, **track_kwargs(settings))
+        metrics = {"train/cross_entropy_loss": stats["track/loss_unfiltered"]}
+        metrics.update({f"train/{k}": v for k, v in stats.items()})
+    metrics["train/aux_loss"] = jnp.asarray(aux, dtype=jnp.float32)
+    return loss + aux, metrics
 
 
 def token_multiplier(
@@ -443,9 +459,9 @@ def loss_and_grads(
     if num_microbatches <= 1:
 
         def loss_fn(m):
-            pp = per_position_loss(m, example, mp=mp, z_loss_weight=z_loss_weight, compute_mapping=compute_mapping)
+            pp, aux = per_position_loss(m, example, mp=mp, z_loss_weight=z_loss_weight, compute_mapping=compute_mapping)
             hist_raw = None if hist is None else tuple(raw(h) for h in hist)
-            loss, metrics = objective(pp.array, weight_named.array, hist_raw, track_settings)
+            loss, metrics = objective(pp.array, weight_named.array, hist_raw, track_settings, aux=aux)
             return loss, (metrics, jax.lax.stop_gradient(pp))
 
         (loss, (metrics, pp)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(model)
@@ -467,11 +483,16 @@ def loss_and_grads(
     ex_split = jax.tree_util.tree_map(split, example, is_leaf=is_named)
     hist_split = None if hist is None else tuple(split(h) for h in hist)
 
+    # Models with an auxiliary loss (Qwen3-MoE) accumulate its gradient separately: it is a mean over microbatches,
+    # not a share of sum(m * per_pos) / sum(m * weight), so it cannot ride on the numerator's accumulator.
+    has_aux = getattr(getattr(model, "config", None), "router_aux_loss_coef", None) is not None
+
     def micro_step(acc, xs):
         ex_mb, hist_mb = xs
+        acc_num, acc_aux, aux_sum = acc
 
         def num_fn(m):
-            pp = per_position_loss(m, ex_mb, mp=mp, z_loss_weight=z_loss_weight, compute_mapping=compute_mapping)
+            pp, aux_mb = per_position_loss(m, ex_mb, mp=mp, z_loss_weight=z_loss_weight, compute_mapping=compute_mapping)
             if track_settings is None:
                 mult = jnp.ones_like(pp.array)
             else:
@@ -479,29 +500,35 @@ def loss_and_grads(
                 mult = token_multiplier(
                     pp.array, w_mb.array, *(h.array for h in hist_mb), **track_kwargs(track_settings)
                 )
-            return jnp.sum(mult * pp.array), jax.lax.stop_gradient(pp)
+            return jnp.sum(mult * pp.array), (jax.lax.stop_gradient(pp), jax.lax.stop_gradient(aux_mb))
 
-        (_, pp), g = eqx.filter_value_and_grad(num_fn, has_aux=True)(model)
-        acc = jax.tree_util.tree_map(lambda a, b: a + b.astype(a.dtype), acc, g)
+        (_, (pp, aux_mb)), g = eqx.filter_value_and_grad(num_fn, has_aux=True)(model)
+        acc_num = jax.tree_util.tree_map(lambda a, b: a + b.astype(a.dtype), acc_num, g)
+        if has_aux:
+            g_aux = eqx.filter_grad(lambda m: per_position_loss(m, ex_mb, mp=mp, z_loss_weight=z_loss_weight, compute_mapping=compute_mapping)[1])(model)
+            acc_aux = jax.tree_util.tree_map(lambda a, b: a + b.astype(a.dtype) / num_microbatches, acc_aux, g_aux)
         if accum_mapping is not None:
-            acc = hax.shard(acc, accum_mapping)
-        return acc, pp
+            acc_num = hax.shard(acc_num, accum_mapping)
+            acc_aux = hax.shard(acc_aux, accum_mapping)
+        return (acc_num, acc_aux, aux_sum + aux_mb / num_microbatches), pp
 
     diff_model = eqx.filter(model, eqx.is_inexact_array)
     acc0 = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, jnp.float32), diff_model)
     if accum_mapping is not None:
         acc0 = hax.shard(acc0, accum_mapping)
-    grads_sum, pp_split = hax.scan(micro_step, Accum)(acc0, (ex_split, hist_split))
+    (grads_sum, grads_aux, aux), pp_split = hax.scan(micro_step, Accum)(
+        (acc0, acc0, jnp.zeros((), jnp.float32)), (ex_split, hist_split)
+    )
     pp = pp_split.flatten_axes((Accum, Micro), Batch)
     w = weight_named.array
     hist_raw = None if hist is None else tuple(raw(h) for h in hist)
-    loss, metrics = objective(pp.array, w, hist_raw, track_settings)
+    loss, metrics = objective(pp.array, w, hist_raw, track_settings, aux=aux)
     if track_settings is None:
         den = jnp.sum(w.astype(jnp.float32))
     else:
         den = jnp.sum(token_multiplier(pp.array, w, *hist_raw, **track_kwargs(track_settings)) * w.astype(jnp.float32))
     scale = jnp.where(den > 0, 1.0 / jnp.where(den > 0, den, 1.0), 0.0)
-    grads = jax.tree_util.tree_map(lambda g, p: (g * scale).astype(p.dtype), grads_sum, diff_model)
+    grads = jax.tree_util.tree_map(lambda g, ga, p: (g * scale + ga).astype(p.dtype), grads_sum, grads_aux, diff_model)
     return loss, metrics, pp, grads
 
 
