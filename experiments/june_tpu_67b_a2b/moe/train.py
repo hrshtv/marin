@@ -957,7 +957,7 @@ def _tail_document_sums_sharded(per_pos, weight, segment_ids, num_docs: int):
 
 
 def _make_tail_score_step(
-    mp: jmp.Policy, *, z_loss_weight: float, num_docs: int, max_turns: int, end_think_id: int
+    mp: jmp.Policy, *, z_loss_weight: float, num_docs: int, max_turns: int, end_think_id: int, freeze_router_bias: bool
 ):
     """Forward-only (loss sum, weight sum) per SPAN with the current weights, the reference scorer.
 
@@ -971,7 +971,9 @@ def _make_tail_score_step(
 
     @jax.jit
     def score_step(params, pending_qb_betas, batch):
-        qb_params = _apply_qb_betas(params, pending_qb_betas)
+        # Same router bias as the train step: with freeze_router_bias the imported params.router_bias is used as is;
+        # applying the (zero) pending QB betas here would score with NO router bias (the bug before 2026-10-21).
+        qb_params = params if freeze_router_bias else _apply_qb_betas(params, pending_qb_betas)
         compute_params = mp.cast_to_compute(qb_params)
         per_pos = compute_params.next_token_loss(
             batch.tokens,
@@ -1073,6 +1075,7 @@ def _run_tail_scoring(
     max_turns: int = 0,
     end_think_id: int = 128003,
     token_dump: str | None = None,
+    freeze_router_bias: bool = False,
 ) -> None:
     """Score every training document under the initial weights and write the reference vector.
 
@@ -1092,7 +1095,7 @@ def _run_tail_scoring(
 
         @jax.jit
         def dump_step(params, pending_qb_betas, batch):
-            qb_params = _apply_qb_betas(params, pending_qb_betas)
+            qb_params = params if freeze_router_bias else _apply_qb_betas(params, pending_qb_betas)
             compute_params = mp.cast_to_compute(qb_params)
             per_pos = compute_params.next_token_loss(
                 batch.tokens, batch.loss_weight, mask=batch.attn_mask, reduction="none", logsumexp_weight=z_loss
@@ -1105,7 +1108,8 @@ def _run_tail_scoring(
         dump_dir.mkdir(parents=True, exist_ok=True)
         dumped = {"loss": [], "weight": [], "span": [], "token": []}
     score_step, num_segments = _make_tail_score_step(
-        mp, z_loss_weight=z_loss_weight, num_docs=num_docs, max_turns=max_turns, end_think_id=end_think_id
+        mp, z_loss_weight=z_loss_weight, num_docs=num_docs, max_turns=max_turns, end_think_id=end_think_id,
+        freeze_router_bias=freeze_router_bias,
     )
     per_doc = num_segments // num_docs  # 1 for the document unit, max_turns * SPANS_PER_TURN for spans
     num = np.zeros(num_segments, dtype=np.float64)
@@ -1468,6 +1472,7 @@ def run_grug_local(config: GrugRunConfig) -> None:
                 max_turns=int(config.trainer.tail_max_turns),
                 end_think_id=int(config.trainer.tail_end_think_id),
                 token_dump=config.trainer.tail_token_dump,
+                freeze_router_bias=config.trainer.freeze_router_bias,
             )
             levanter.tracker.current_tracker().finish()
             return
