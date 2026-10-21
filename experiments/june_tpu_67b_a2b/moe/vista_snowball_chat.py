@@ -1449,6 +1449,8 @@ def snowball_chat_run_config(
             trace_out=trace_out,
             # SNOWBALL_FREEZE_ROUTER_BIAS=1 keeps the imported router biases fixed (the Grug 09.21 SFT recipe).
             freeze_router_bias=os.environ.get("SNOWBALL_FREEZE_ROUTER_BIAS", "0") == "1",
+            # SNOWBALL_MASTER_FP32=1: fp32 master weights (the recipe's param dtype) instead of the imported bf16.
+            master_fp32=os.environ.get("SNOWBALL_MASTER_FP32", "0") == "1",
             # SNOWBALL_FREEZE_ROUTER_WEIGHTS=1 also pins the gate projection (run 3 onward).
             freeze_router_weights=os.environ.get("SNOWBALL_FREEZE_ROUTER_WEIGHTS", "0") == "1",
             schedule_steps=schedule_steps,

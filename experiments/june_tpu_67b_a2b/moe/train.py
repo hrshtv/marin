@@ -200,6 +200,11 @@ class GrugTrainerConfig:
     # family under narrow SFT data (Grug 09.21 run 2: relL2 ~0.1 vs ~3.5e-3 elsewhere). Implies
     # freeze_router_bias semantics for the bias copy as well.
     freeze_router_weights: bool = False
+    # Cast the loaded base weights to the mixed-precision param dtype (float32 in the Snowball recipe). Off by default
+    # for reproducibility: before 2026-10-21 every Snowball SFT run kept the imported bf16 tensors as its master
+    # weights, so optax.apply_updates rounded each update back to bf16 and updates below half an ulp (~2e-3
+    # relative) vanished. SNOWBALL_MASTER_FP32=1 turns the cast on.
+    master_fp32: bool = False
     # LR-schedule horizon in steps; None => num_train_steps. Set it LONGER than num_train_steps to train the
     # first part of a longer schedule now (e.g. one epoch of a two-epoch cosine) and resume later on the same
     # output with a larger num_train_steps: the loop picks up this run's own checkpoint (optimizer state and
@@ -556,9 +561,13 @@ def init_weights_only_from_checkpoint(
     *,
     mesh: Mesh | None,
     load_ema: bool,
+    param_dtype: jnp.dtype | None = None,
     _load_fn: Callable[..., object] = load_checkpoint,
 ) -> GrugTrainState:
     """Load only model weights from an external checkpoint, resetting the optimizer.
+
+    ``param_dtype`` casts the loaded floating-point leaves (the master weights) to that dtype; None keeps the
+    checkpoint's stored dtype (bf16 for every Snowball import so far).
 
     This is the SFT/RL init (marin #650): the base checkpoint supplies ``params`` and the
     ``pending_qb_betas`` router-bias state; the optimizer state and ``step`` stay at their
@@ -573,9 +582,13 @@ def init_weights_only_from_checkpoint(
     # optimizer tree is never touched and stays fresh from ``state``.
     exemplar: dict[str, object] = {"params": state.params, "pending_qb_betas": state.pending_qb_betas}
     loaded = cast("dict[str, object]", _load_fn(exemplar, checkpoint_path, mesh=mesh, allow_partial=True))
-    updates: dict[str, object] = {"params": loaded["params"], "pending_qb_betas": loaded["pending_qb_betas"]}
+    params = loaded["params"]
+    if param_dtype is not None:
+        params = jax.tree_util.tree_map(lambda x: x.astype(param_dtype) if eqx.is_inexact_array(x) else x, params)
+        logger.info(f"Base weights cast to {jnp.dtype(param_dtype).name} master weights")
+    updates: dict[str, object] = {"params": params, "pending_qb_betas": loaded["pending_qb_betas"]}
     if load_ema and state.ema_params is not None:
-        updates["ema_params"] = loaded["params"]
+        updates["ema_params"] = params
     return dataclasses.replace(state, **updates)
 
 
@@ -1377,6 +1390,7 @@ def run_grug_local(config: GrugRunConfig) -> None:
                     trainer.initialize_from,
                     mesh=mesh,
                     load_ema=config.trainer.ema_beta is not None,
+                    param_dtype=trainer.mp.param_dtype if config.trainer.master_fp32 else None,
                 )
         else:
             state = restore_grug_state_from_checkpoint(
@@ -1388,6 +1402,10 @@ def run_grug_local(config: GrugRunConfig) -> None:
                 initialize_from=trainer.initialize_from,
             )
 
+        if checkpointer is not None:
+            # The restored step is the last saved one. Checkpointer starts at 0, which made the first loop iteration
+            # after a resume re-save token-history.npz tagged step 0 (and a second resume then discard the history).
+            checkpointer._last_save_step = int(state.step)
         track_history_path = os.path.join(checkpointer.base_path, "token-history.npz") if checkpointer is not None else None
         track_saved_step = int(state.step)
         if track_history is not None and int(state.step) > 0:

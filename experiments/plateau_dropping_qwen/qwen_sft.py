@@ -972,6 +972,9 @@ def run_training(cfg: QwenSftConfig) -> dict[str, Any]:
         checkpointer = trainer_config.checkpointer.create(run_id)
         history_path = history_path_for(checkpointer.base_path)
         history_restored = restore_history(track, history_path, int(state.step))
+        # The restored step is the last saved one (Levanter's Checkpointer starts at 0; without this the first loop
+        # iteration after a resume re-saved the token history tagged step 0).
+        checkpointer._last_save_step = int(state.step)
         saver = HistorySaver(track, history_path, int(state.step), is_writer=jax.process_index() == 0)
 
         grug_ds = build_grug_dataset(
