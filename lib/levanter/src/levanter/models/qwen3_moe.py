@@ -77,6 +77,10 @@ class Qwen3MoeConfig(LlamaConfig):
     # sparse forward value but routes the dense all-experts gradient to the router logits. Default
     # off; the exported/served forward is untouched. See levanter.models.moe.dense_router_delta.
     dense_router_gradient: bool = False
+    # Expert matmuls through haliax ``ragged_dot`` (Pallas-Triton on GPU, megablox on TPU) instead of
+    # ``jax.lax.ragged_dot_general``, whose GPU lowering materializes (tokens x experts) intermediates: at
+    # 64k tokens x top-8 it asked for 6 TiB (Qwen3-30B-A3B, 2026-10-20). Numerics are the same bf16 GEMM.
+    use_gmm: bool = False
 
     sliding_window: int | None = None
     max_window_layers: int = 48
@@ -250,11 +254,12 @@ class Qwen3MoeExperts(ModuleWithStateDictSerialization):
         *,
         key,
         use_bias: bool = False,
+        use_gmm: bool = False,
     ) -> "Qwen3MoeExperts":
         k_gate, k_up, k_down = jrandom.split(key, 3)
-        gate_proj = hnn.MoELinear.init(Experts=Experts, Out=Mlp, In=Embed, key=k_gate, use_bias=use_bias)
-        up_proj = hnn.MoELinear.init(Experts=Experts, Out=Mlp, In=Embed, key=k_up, use_bias=use_bias)
-        down_proj = hnn.MoELinear.init(Experts=Experts, Out=Embed, In=Mlp, key=k_down, use_bias=use_bias)
+        gate_proj = hnn.MoELinear.init(Experts=Experts, Out=Mlp, In=Embed, key=k_gate, use_bias=use_bias, use_gmm=use_gmm)
+        up_proj = hnn.MoELinear.init(Experts=Experts, Out=Mlp, In=Embed, key=k_up, use_bias=use_bias, use_gmm=use_gmm)
+        down_proj = hnn.MoELinear.init(Experts=Experts, Out=Embed, In=Mlp, key=k_down, use_bias=use_bias, use_gmm=use_gmm)
         return Qwen3MoeExperts(gate_proj, up_proj, down_proj, activation_fn)
 
     @named_call
@@ -312,6 +317,7 @@ class Qwen3MoeSparseMoeBlock(eqx.Module):
             activation_fn=config.activation_function.to_fn(),
             key=k_experts,
             use_bias=False,
+            use_gmm=config.use_gmm,
         )
         return Qwen3MoeSparseMoeBlock(config, gate, experts)
 

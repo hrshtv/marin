@@ -609,6 +609,8 @@ def qwen_model_config(hf_config, *, attn_backend: str, flash_block_size: int | N
     from levanter.layers.attention import AttentionBackend  # noqa: PLC0415
 
     cfg = levanter_config_class(hf_config.model_type).from_hf_config(hf_config)
+    if hf_config.model_type == "qwen3_moe":
+        cfg = dataclasses.replace(cfg, use_gmm=True)   # GPU: the XLA ragged_dot_general lowering OOMs at 64k x top-8
     return dataclasses.replace(
         cfg,
         attn_backend=AttentionBackend(attn_backend),
