@@ -119,6 +119,9 @@ class GrugModelConfig:
     disable_long_rope: bool = False
     attention_implementation: GrugAttentionImplementation | None = None
     moe_implementation: MoeImplementation | None = None
+    moe_capacity_factor: float = _DEFAULT_EP_CAPACITY_FACTOR
+    """Expert-parallel capacity per receiving shard, as a multiple of the even-split assignment count; assignments
+    beyond it are dropped (train/router/capacity_overflow_rate). Larger = fewer drops, larger dispatch buffers."""
     ce_implementation: str | None = None
     """Fused cross-entropy backend selection (levanter fused_cross_entropy_loss). None keeps the
     backend default (GPU: full-logits ``xla`` path). Set ``"batched_xla"`` to use the blocked-vocab
@@ -533,7 +536,7 @@ class MoEMLP(eqx.Module):
                 key=k_expert,
                 implementation=cfg.moe_implementation,
                 activation=ActivationFunctionEnum.silu,
-                capacity_factor=_DEFAULT_EP_CAPACITY_FACTOR,
+                capacity_factor=cfg.moe_capacity_factor,
             ),
             cfg=cfg,
         )

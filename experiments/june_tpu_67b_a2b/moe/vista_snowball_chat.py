@@ -1404,7 +1404,12 @@ def snowball_chat_run_config(
             f"stops early once every document has been scored."
         )
     return GrugRunConfig(
-        model=dataclasses.replace(SNOWBALL_CHAT_MODEL_CONFIG, max_seq_len=SNOWBALL_CHAT_SEQUENCE_LENGTH),
+        # SNOWBALL_MOE_CAPACITY_FACTOR (default 1.25, unchanged): EP capacity per receiving shard; see GrugModelConfig.
+        model=dataclasses.replace(
+            SNOWBALL_CHAT_MODEL_CONFIG,
+            max_seq_len=SNOWBALL_CHAT_SEQUENCE_LENGTH,
+            moe_capacity_factor=float(os.environ.get("SNOWBALL_MOE_CAPACITY_FACTOR") or SNOWBALL_CHAT_MODEL_CONFIG.moe_capacity_factor),
+        ),
         data=snowball_chat_data_config(cache_path=data_cache_path, tokenizer_path=tokenizer_path, stage=stage),
         resources=run_resources,
         optimizer=optimizer,
