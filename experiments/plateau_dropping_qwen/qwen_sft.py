@@ -582,7 +582,10 @@ def trainer_mesh_config():
     return MeshConfig(
         axes={"data": -1, "replica": 1, "model": 1},
         dcn_axes={"replica_dcn": -1},
-        compute_mapping={"batch": ["replica_dcn", "replica", "data"]},
+        # "token" / "token_repeat": the flattened (batch x position) axes of Levanter's MoE block (Qwen3-MoE); unmapped
+        # they are replicated, and every device then holds the whole global batch's expert tensors (128 GiB in the
+        # backward of the 30B-A3B smoke test, job 64279). Levanter's own MoE configs map token -> data the same way.
+        compute_mapping={ax: ["replica_dcn", "replica", "data"] for ax in ("batch", "token", "token_repeat")},
         param_mapping={"embed": ["replica_dcn", "data"]},
     )
 
