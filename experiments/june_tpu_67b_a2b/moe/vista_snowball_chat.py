@@ -1404,7 +1404,8 @@ def snowball_chat_run_config(
             f"stops early once every document has been scored."
         )
     return GrugRunConfig(
-        # SNOWBALL_MOE_CAPACITY_FACTOR (default 1.25, unchanged): EP capacity per receiving shard; see GrugModelConfig.
+        # SNOWBALL_MOE_CAPACITY_FACTOR (default 1.0 = model.py _DEFAULT_EP_CAPACITY_FACTOR, unchanged): EP capacity per
+        # receiving shard as a multiple of the even split; see GrugModelConfig.moe_capacity_factor.
         model=dataclasses.replace(
             SNOWBALL_CHAT_MODEL_CONFIG,
             max_seq_len=SNOWBALL_CHAT_SEQUENCE_LENGTH,
