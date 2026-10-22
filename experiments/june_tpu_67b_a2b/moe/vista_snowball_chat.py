@@ -1350,6 +1350,15 @@ def snowball_chat_run_config(
     lr_override = os.environ.get("SNOWBALL_LR")
     if lr_override:
         optimizer = dataclasses.replace(optimizer, learning_rate=float(lr_override), adam_lr=float(lr_override))
+    # SNOWBALL_MAX_GRAD_NORM overrides the global gradient-norm clip (OptimizerConfig.max_grad_norm, default 1.0;
+    # "0" or "none" disables clipping). Plateau Dropping averages the loss over the kept tokens only, so once it
+    # drops ~half of them its gradient norm sits at 1.3-2.9 and most steps are clipped at 1.0 (50% of steps in the
+    # 760-step run, 86% in the 1,520-step run) while plain SFT is clipped on 3-4% of steps; the clip ablation
+    # raises the threshold so the two arms see the same clipping regime.
+    clip_override = os.environ.get("SNOWBALL_MAX_GRAD_NORM")
+    if clip_override:
+        max_grad_norm = None if clip_override.strip().lower() in ("0", "none", "off") else float(clip_override)
+        optimizer = dataclasses.replace(optimizer, max_grad_norm=max_grad_norm)
     # TailSFT knobs (train.py GrugTrainerConfig, tail_filter.py), all off by default. SNOWBALL_TAIL_SCORE_OUT
     # turns the run into the forward-only reference pass over one epoch (launch with EPOCHS=1) and writes the
     # (num_docs,) .npy there; SNOWBALL_TAIL_FRACTION + SNOWBALL_TAIL_REF train the filtered objective;
