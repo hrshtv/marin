@@ -158,6 +158,10 @@ class GrugTrainerConfig:
     # Scoring pass only: also write every trained position's (loss, weight, span id, token id) as one .npz per
     # host under this directory, so per-token probability histograms and samples can be read offline.
     tail_token_dump: str | None = None
+    # Scoring pass only: also write the base model's loss on EVERY trained token as a
+    # ``(num_docs * track_max_len,)`` float16 table (NaN = never scored), keyed like the tracker's history
+    # (``token_track.token_keys``). It is the reference for ``tail_unit="token"``.
+    tail_token_ref_out: str | None = None
     # Clip SFT (token_clip.py): per-token clipping of the training loss. Tokens the model already gives
     # p > clip_p_hi get no gradient; with clip_p_lo set, neither do tokens below it. clip_random_frac drops
     # trained tokens at random instead (the control). All off by default; cannot be combined with TailSFT.
@@ -625,6 +629,7 @@ def _make_train_step(
         track_prev2=None,
         track_count=None,
         track_dropped=None,
+        tail_token_ref=None,
         *,
         compute_watch: bool = False,
     ):
@@ -711,6 +716,26 @@ def _make_train_step(
                 summarized = dict(summarized)
                 summarized["train/cross_entropy_loss"] = clip_stats["clip/loss_unfiltered"]
                 summarized.update({f"train/{k}": v for k, v in clip_stats.items()})
+                return loss, summarized
+
+        elif tail.unit == "token":
+
+            def loss_fn(params):
+                compute_params = mp.cast_to_compute(params)
+                per_pos, summarized = compute_params.next_token_loss(
+                    batch.tokens,
+                    batch.loss_weight,
+                    mask=batch.attn_mask,
+                    reduction="none",
+                    logsumexp_weight=z_loss,
+                    return_router_metrics=True,
+                )
+                fraction = tail_filter.tail_schedule(state.step, tail.fraction, tail.ramp_steps)
+                loss, tail_stats = _tail_token_loss_sharded(per_pos, batch.loss_weight, tail_token_ref, fraction)
+                loss = loss + summarized["train/router/aux_loss_weighted"]
+                summarized = dict(summarized)
+                summarized["train/cross_entropy_loss"] = tail_stats["tail/loss_unfiltered"]
+                summarized.update({f"train/{k}": v for k, v in tail_stats.items()})
                 return loss, summarized
 
         else:
@@ -812,6 +837,8 @@ class TailSettings:
     max_turns: int = 0
     end_think_id: int = 128003
     num_docs: int = 0
+    token_ref: np.ndarray | None = None  # unit "token": (num_docs * max_len,) float16, the per-token reference
+    max_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -1034,6 +1061,16 @@ def _track_loss_sharded(per_pos, weight, prev1, prev2, count, dropped, *, tol, f
     return _tail_shard_map_rows(_fn, (per_pos, weight, prev1, prev2, count, dropped), (), out_specs=(P(), stats_specs))
 
 
+def _tail_token_loss_sharded(per_pos, weight, ref_pos, fraction):
+    """Token-level TailSFT over local rows; the per-token reference arrives as one more row-sharded input."""
+    stats_specs = {k: P() for k in tail_filter.TOKEN_STAT_KEYS}
+
+    def _fn(a, b, r, frac, *, psum):
+        return tail_filter.token_filtered_loss(a, b, r, frac, psum=psum)
+
+    return _tail_shard_map_rows(_fn, (per_pos, weight, ref_pos), (fraction,), out_specs=(P(), stats_specs))
+
+
 def _tail_token_dump_sharded(per_pos, weight, batch, *, num_docs, max_turns, end_think_id):
     """Row-sharded ``(loss, weight, span id, token id)`` for every position, for the scoring pass's token dump.
 
@@ -1089,6 +1126,8 @@ def _run_tail_scoring(
     end_think_id: int = 128003,
     token_dump: str | None = None,
     freeze_router_bias: bool = False,
+    token_ref_out: str | None = None,
+    max_len: int = 0,
 ) -> None:
     """Score every training document under the initial weights and write the reference vector.
 
@@ -1120,6 +1159,22 @@ def _run_tail_scoring(
         dump_dir = Path(token_dump)
         dump_dir.mkdir(parents=True, exist_ok=True)
         dumped = {"loss": [], "weight": [], "span": [], "token": []}
+    pos_step = None
+    if token_ref_out:
+        if max_len <= 0:
+            raise ValueError("tail_token_ref_out needs track_max_len > 0 (the cache's longest document)")
+        z_loss = z_loss_weight if z_loss_weight > 0 else None
+
+        @jax.jit
+        def pos_step(params, pending_qb_betas, batch):
+            qb_params = params if freeze_router_bias else _apply_qb_betas(params, pending_qb_betas)
+            compute_params = mp.cast_to_compute(qb_params)
+            return compute_params.next_token_loss(
+                batch.tokens, batch.loss_weight, mask=batch.attn_mask, reduction="none", logsumexp_weight=z_loss
+            )
+
+        tok_num = np.zeros(num_docs * max_len, dtype=np.float32)
+        tok_den = np.zeros(num_docs * max_len, dtype=np.float32)
     score_step, num_segments = _make_tail_score_step(
         mp, z_loss_weight=z_loss_weight, num_docs=num_docs, max_turns=max_turns, end_think_id=end_think_id,
         freeze_router_bias=freeze_router_bias,
@@ -1140,6 +1195,16 @@ def _run_tail_scoring(
             dumped["weight"].append(_local_rows(d_weight).astype(np.float16))
             dumped["span"].append(_local_rows(d_span))
             dumped["token"].append(_local_rows(d_tok))
+        if pos_step is not None:
+            # Every process gathers the whole batch (a collective) and fills the same table; a token drawn more than
+            # once gets the weighted mean of its occurrences, like the document reference.
+            pp_np = multihost_utils.process_allgather(pos_step(state.params, state.pending_qb_betas, batch), tiled=True)
+            w_np = multihost_utils.process_allgather(batch.loss_weight, tiled=True)
+            seg_np = multihost_utils.process_allgather(_packed_segment_ids(batch), tiled=True)
+            keys = token_track.token_keys(seg_np, w_np, num_docs, max_len)
+            valid = keys >= 0
+            np.add.at(tok_num, keys[valid], np.asarray(pp_np, dtype=np.float32)[valid])
+            np.add.at(tok_den, keys[valid], np.asarray(w_np, dtype=np.float32)[valid])
         b_num = np.asarray(jax.device_get(b_num), dtype=np.float64)
         b_den = np.asarray(jax.device_get(b_den), dtype=np.float64)
         overflow_total += int(jax.device_get(b_overflow))
@@ -1162,6 +1227,20 @@ def _run_tail_scoring(
             batches=np.int64(batches_run),
         )
         logger.info(f"TAIL_TOKEN_DUMP wrote rank {jax.process_index()} rows to {dump_dir}")
+    if pos_step is not None and jax.process_index() == 0:
+        scored_tok = tok_den > 0
+        ref_tok = np.full(tok_num.shape, np.nan, dtype=np.float16)
+        ref_tok[scored_tok] = (tok_num[scored_tok] / tok_den[scored_tok]).astype(np.float16)
+        out_tok = Path(token_ref_out)
+        out_tok.parent.mkdir(parents=True, exist_ok=True)
+        np.save(out_tok, ref_tok)
+        out_tok.with_suffix(".json").write_text(json.dumps({
+            "num_docs": int(num_docs), "max_len": int(max_len), "scored_tokens": int(scored_tok.sum()),
+            "weighted_tokens": float(tok_den.sum()),
+            "mean_loss": float(tok_num[scored_tok].sum() / tok_den[scored_tok].sum()) if scored_tok.any() else None,
+            "batches": int(batches_run), "dtype": "float16", "keys": "token_track.token_keys(doc, offset)",
+        }, indent=1))
+        logger.info(f"TAIL_TOKEN_REF wrote {out_tok}: {int(scored_tok.sum()):,} scored tokens")
     if overflow_total:
         raise ValueError(
             f"{overflow_total} supervised positions sat past turn {max_turns} of their document: raise "
@@ -1226,28 +1305,52 @@ def run_grug_local(config: GrugRunConfig) -> None:
         if not (0.0 < config.trainer.tail_fraction < 1.0):
             raise ValueError(f"tail_fraction must lie in (0, 1); got {config.trainer.tail_fraction}.")
         unit = config.trainer.tail_unit
-        if unit not in TAIL_UNITS:
-            raise ValueError(f"tail_unit must be one of {TAIL_UNITS}; got {unit!r}")
-        max_turns = int(config.trainer.tail_max_turns)
-        if unit != "document" and max_turns <= 0:
-            raise ValueError(f"tail_unit={unit!r} needs tail_max_turns > 0 (the cache's true maximum).")
-        # tail_num_docs stays the cache's document count; the reference must carry one entry per unit.
-        expected = tail_unit_segments(unit, int(config.trainer.tail_num_docs), max_turns)
-        ref = tail_filter.load_reference_losses(config.trainer.tail_ref_loss_path, expected)
-        tail = TailSettings(
-            fraction=float(config.trainer.tail_fraction),
-            ramp_steps=int(config.trainer.tail_ramp_steps),
-            ref_loss=ref,
-            unit=unit,
-            max_turns=max_turns,
-            end_think_id=int(config.trainer.tail_end_think_id),
-            num_docs=int(config.trainer.tail_num_docs),
-        )
-        logger.info(
-            f"TailSFT on: unit={unit} fraction={tail.fraction} ramp_steps={tail.ramp_steps} "
-            f"max_turns={max_turns} reference={config.trainer.tail_ref_loss_path} "
-            f"scored={int(np.isfinite(ref).sum())}/{ref.shape[0]} segments"
-        )
+        if unit == "token":
+            max_len = int(config.trainer.track_max_len)
+            table = np.load(config.trainer.tail_ref_loss_path, mmap_mode="r")
+            expected = int(config.trainer.tail_num_docs) * max_len
+            if table.shape != (expected,):
+                raise ValueError(
+                    f"tail_unit='token' reference {config.trainer.tail_ref_loss_path} has shape {table.shape}; expected "
+                    f"({expected},) = tail_num_docs {config.trainer.tail_num_docs} x track_max_len {max_len}"
+                )
+            table = np.ascontiguousarray(table, dtype=np.float16)
+            tail = TailSettings(
+                fraction=float(config.trainer.tail_fraction),
+                ramp_steps=int(config.trainer.tail_ramp_steps),
+                ref_loss=np.zeros(1, dtype=np.float32),
+                unit=unit,
+                num_docs=int(config.trainer.tail_num_docs),
+                token_ref=table,
+                max_len=max_len,
+            )
+            logger.info(
+                f"TailSFT on: unit=token fraction={tail.fraction} ramp_steps={tail.ramp_steps} "
+                f"reference={config.trainer.tail_ref_loss_path} scored={int(np.isfinite(table).sum()):,} tokens"
+            )
+        else:
+            if unit not in TAIL_UNITS:
+                raise ValueError(f"tail_unit must be one of {TAIL_UNITS + ('token',)}; got {unit!r}")
+            max_turns = int(config.trainer.tail_max_turns)
+            if unit != "document" and max_turns <= 0:
+                raise ValueError(f"tail_unit={unit!r} needs tail_max_turns > 0 (the cache's true maximum).")
+            # tail_num_docs stays the cache's document count; the reference must carry one entry per unit.
+            expected = tail_unit_segments(unit, int(config.trainer.tail_num_docs), max_turns)
+            ref = tail_filter.load_reference_losses(config.trainer.tail_ref_loss_path, expected)
+            tail = TailSettings(
+                fraction=float(config.trainer.tail_fraction),
+                ramp_steps=int(config.trainer.tail_ramp_steps),
+                ref_loss=ref,
+                unit=unit,
+                max_turns=max_turns,
+                end_think_id=int(config.trainer.tail_end_think_id),
+                num_docs=int(config.trainer.tail_num_docs),
+            )
+            logger.info(
+                f"TailSFT on: unit={unit} fraction={tail.fraction} ramp_steps={tail.ramp_steps} "
+                f"max_turns={max_turns} reference={config.trainer.tail_ref_loss_path} "
+                f"scored={int(np.isfinite(ref).sum())}/{ref.shape[0]} segments"
+            )
     track: TrackSettings | None = None
     track_history: token_track.TokenHistory | None = None
     trace: token_track.TraceRecorder | None = None
@@ -1491,6 +1594,8 @@ def run_grug_local(config: GrugRunConfig) -> None:
                 end_think_id=int(config.trainer.tail_end_think_id),
                 token_dump=config.trainer.tail_token_dump,
                 freeze_router_bias=config.trainer.freeze_router_bias,
+                token_ref_out=config.trainer.tail_token_ref_out,
+                max_len=int(config.trainer.track_max_len),
             )
             levanter.tracker.current_tracker().finish()
             return
@@ -1543,6 +1648,17 @@ def run_grug_local(config: GrugRunConfig) -> None:
                             "occurrence kept",
                             int(state.step) - 1, diag["duplicate_keys"], diag["keys"], diag["documents_with_duplicates"],
                         )
+                elif tail is not None and tail.unit == "token":
+                    seg_np = multihost_utils.process_allgather(_packed_segment_ids(batch), tiled=True)
+                    w_np = multihost_utils.process_allgather(batch.loss_weight, tiled=True)
+                    keys = token_track.token_keys(seg_np, w_np, tail.num_docs, tail.max_len)
+                    safe = np.where(keys >= 0, keys, 0)
+                    ref_np = np.where(keys >= 0, tail.token_ref[safe].astype(np.float32), np.nan).astype(np.float32)
+                    shard = batch.loss_weight.sharding
+                    ref_global = jax.make_array_from_callback(ref_np.shape, shard, lambda idx: ref_np[idx])
+                    state, metrics, watch_stats, _ = train_step(
+                        state, batch, tail_token_ref=ref_global, compute_watch=compute_watch
+                    )
                 else:
                     state, metrics, watch_stats, _ = train_step(state, batch, compute_watch=compute_watch)
                 step = int(state.step) - 1

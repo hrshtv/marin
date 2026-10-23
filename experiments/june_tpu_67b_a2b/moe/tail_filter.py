@@ -357,3 +357,73 @@ def load_reference_losses(path: str, num_docs: int) -> np.ndarray:
     if n_scored == 0:
         raise ValueError(f"reference losses at {path} contain no finite entry")
     return ref
+
+
+# Token-level TailSFT: the same rule applied to single tokens, against the base model's loss on that very token.
+TOKEN_STAT_KEYS: tuple[str, ...] = (
+    "tail/scorable_tokens",
+    "tail/dropped_tokens",
+    "tail/target_drop",
+    "tail/threshold_margin",
+    "tail/mean_margin",
+    "tail/loss_unfiltered",
+    "tail/kept_token_frac",
+    "tail/fraction",
+)
+
+
+def token_filtered_loss(
+    per_pos: jax.Array,
+    weight: jax.Array,
+    ref_pos: jax.Array,
+    fraction: jax.Array | float,
+    *,
+    psum: PsumFn = _identity,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """TailSFT at the token level, on local rows.
+
+    ``ref_pos`` is the base model's loss on the token each position predicts (NaN where it was never scored),
+    gathered on the host from the scoring pass's per-token table with the same ``(document, offset)`` keys the
+    tracker uses. ``margin = current token loss - reference``; the ``floor(fraction * M)`` scorable tokens
+    (trained, finite reference) with the smallest margin are dropped. The rank is taken over the device's own
+    rows rather than the global batch: rows are a random sample of the batch, so the per-shard quantile matches
+    the global one up to sampling noise, and it avoids gathering every token's margin. The loss is the weighted
+    mean over the kept tokens, exactly like the document unit and like Plateau Dropping.
+    """
+    w = weight.reshape(-1).astype(jnp.float32)
+    pp = per_pos.reshape(-1).astype(jnp.float32)
+    ref = ref_pos.reshape(-1).astype(jnp.float32)
+    trained = w > 0
+    now = jnp.where(trained, pp / jnp.where(trained, w, 1.0), 0.0)
+    scorable = trained & jnp.isfinite(ref)
+    margin = jnp.where(scorable, now - ref, jnp.inf)
+    n = margin.shape[0]
+    m = jnp.sum(scorable).astype(jnp.int32)
+    k = jnp.floor(jnp.asarray(fraction, dtype=jnp.float32) * m.astype(jnp.float32)).astype(jnp.int32)
+    k = jnp.clip(k, 0, jnp.maximum(m - 1, 0))  # never drop every scorable token of a shard
+    order = jnp.argsort(margin, stable=True)  # +inf (not scorable) sorts last
+    ranks = jnp.zeros(n, dtype=jnp.int32).at[order].set(jnp.arange(n, dtype=jnp.int32))
+    kth = margin[order[jnp.clip(k - 1, 0, n - 1)]]
+    thresh = jnp.where(k > 0, kth, -jnp.inf)
+    drop = scorable & (ranks < k)
+    keep = jax.lax.stop_gradient(trained & jnp.logical_not(drop))
+    loss_sum = psum(jnp.sum(jnp.where(keep, pp, 0.0)))
+    w_kept = psum(jnp.sum(jnp.where(keep, w, 0.0)))
+    loss_all = psum(jnp.sum(pp))
+    w_all = psum(jnp.sum(w))
+    loss = jnp.where(w_kept > 0, loss_sum / jnp.where(w_kept > 0, w_kept, 1.0), 0.0)
+    unfiltered = jnp.where(w_all > 0, loss_all / jnp.where(w_all > 0, w_all, 1.0), 0.0)
+    shards = psum(jnp.ones((), dtype=jnp.float32))
+    m_all = jnp.maximum(psum(m.astype(jnp.float32)), 1.0)
+    stats = {
+        "tail/scorable_tokens": psum(m.astype(jnp.float32)),
+        "tail/dropped_tokens": psum(jnp.sum(drop).astype(jnp.float32)),
+        "tail/target_drop": psum(k.astype(jnp.float32)),
+        "tail/threshold_margin": psum(jnp.where(jnp.isfinite(thresh), thresh, 0.0)) / shards,
+        "tail/mean_margin": psum(jnp.sum(jnp.where(scorable, margin, 0.0))) / m_all,
+        "tail/loss_unfiltered": unfiltered,
+        "tail/kept_token_frac": jnp.where(w_all > 0, w_kept / jnp.where(w_all > 0, w_all, 1.0), 0.0),
+        "tail/fraction": jnp.asarray(fraction, dtype=jnp.float32),
+    }
+    assert tuple(stats) == TOKEN_STAT_KEYS, (tuple(stats), TOKEN_STAT_KEYS)
+    return loss, {k_: jax.lax.stop_gradient(v) for k_, v in stats.items()}

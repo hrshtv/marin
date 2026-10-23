@@ -1376,6 +1376,9 @@ def snowball_chat_run_config(
     tail_max_turns = int(os.environ.get("SNOWBALL_TAIL_MAX_TURNS") or 0)
     tail_end_think_id = int(os.environ.get("SNOWBALL_TAIL_END_THINK_ID") or 128003)
     tail_token_dump = os.environ.get("SNOWBALL_TAIL_TOKEN_DUMP") or None
+    # SNOWBALL_TAIL_TOKEN_REF_OUT (scoring pass): also write the per-token reference table that SNOWBALL_TAIL_UNIT=token
+    # trains against (SNOWBALL_TAIL_REF then points at that .npy; SNOWBALL_TRACK_MAX_LEN bounds the table).
+    tail_token_ref_out = os.environ.get("SNOWBALL_TAIL_TOKEN_REF_OUT") or None
     # Clip SFT (token_clip.py): SNOWBALL_CLIP_P_HI / SNOWBALL_CLIP_P_LO are probabilities in (0, 1);
     # SNOWBALL_CLIP_RANDOM_FRAC drops trained tokens at random instead (the control). Unset = off.
     clip_p_hi = float(os.environ["SNOWBALL_CLIP_P_HI"]) if os.environ.get("SNOWBALL_CLIP_P_HI") else None
@@ -1441,6 +1444,7 @@ def snowball_chat_run_config(
             tail_max_turns=tail_max_turns,
             tail_end_think_id=tail_end_think_id,
             tail_token_dump=tail_token_dump,
+            tail_token_ref_out=tail_token_ref_out,
             clip_p_hi=clip_p_hi,
             clip_p_lo=clip_p_lo,
             clip_random_frac=clip_random_frac,

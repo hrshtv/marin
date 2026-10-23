@@ -53,6 +53,27 @@ class Reentry(StrEnum):
     RISE = "rise"  # its loss rose by more than tol; a falling loss keeps it dropped
 
 
+def token_keys(segment_ids: np.ndarray, weight: np.ndarray, num_docs: int, max_len: int) -> np.ndarray:
+    """``(B, S)`` int64 key per trained position (``row * max_len + offset``), ``-1`` elsewhere.
+
+    Documents are contiguous within a packed row, so a token's offset in its document is its index minus the
+    index where that run of equal segment ids began. Shared by the tracker's history table and the token-level
+    TailSFT reference table, so both address the same (document, offset) cell.
+    """
+    seg = np.asarray(segment_ids).astype(np.int64)
+    idx = np.broadcast_to(np.arange(seg.shape[1])[None, :], seg.shape)
+    starts = np.ones_like(seg, dtype=bool)
+    starts[:, 1:] = seg[:, 1:] != seg[:, :-1]
+    run_start = np.maximum.accumulate(np.where(starts, idx, 0), axis=1)
+    offset = idx - run_start
+    trained = (np.asarray(weight) > 0) & (seg >= 0)
+    if trained.any() and int(offset[trained].max()) >= max_len:
+        raise ValueError(f"a document is longer than max_len={max_len}: offset {int(offset[trained].max())}")
+    if trained.any() and int(seg[trained].max()) >= num_docs:
+        raise ValueError(f"segment id {int(seg[trained].max())} >= num_docs={num_docs}")
+    return np.where(trained, seg * max_len + offset, -1)
+
+
 class TokenHistory:
     """Replicated host-side table: the last two observed losses, the visit count and the last drop decision of every token."""
 
@@ -87,23 +108,8 @@ class TokenHistory:
         return True
 
     def keys(self, segment_ids: np.ndarray, weight: np.ndarray) -> np.ndarray:
-        """``(B, S)`` int64 key per trained position (``row * max_len + offset``), ``-1`` elsewhere.
-
-        Documents are contiguous within a packed row, so a token's offset in its document is its index minus
-        the index where that run of equal segment ids began.
-        """
-        seg = np.asarray(segment_ids).astype(np.int64)
-        idx = np.broadcast_to(np.arange(seg.shape[1])[None, :], seg.shape)
-        starts = np.ones_like(seg, dtype=bool)
-        starts[:, 1:] = seg[:, 1:] != seg[:, :-1]
-        run_start = np.maximum.accumulate(np.where(starts, idx, 0), axis=1)
-        offset = idx - run_start
-        trained = (np.asarray(weight) > 0) & (seg >= 0)
-        if trained.any() and int(offset[trained].max()) >= self.max_len:
-            raise ValueError(f"a document is longer than max_len={self.max_len}: offset {int(offset[trained].max())}")
-        if trained.any() and int(seg[trained].max()) >= self.num_docs:
-            raise ValueError(f"segment id {int(seg[trained].max())} >= num_docs={self.num_docs}")
-        return np.where(trained, seg * self.max_len + offset, -1)
+        """``(B, S)`` int64 key per trained position (``row * max_len + offset``), ``-1`` elsewhere (see ``token_keys``)."""
+        return token_keys(segment_ids, weight, self.num_docs, self.max_len)
 
     def gather(self, keys: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """``(prev1, prev2, count, dropped)`` for the batch's positions, NaN / 0 where there is no trained token."""
