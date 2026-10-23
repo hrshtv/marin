@@ -1690,7 +1690,21 @@ def run_grug_local(config: GrugRunConfig) -> None:
                     }
                     if router_metrics:
                         levanter.tracker.log(router_metrics, step=step)
-                    if tail is not None and step % log_every == 0:
+                    if tail is not None and tail.unit == "token" and step % log_every == 0:
+                        logger.info(
+                            "tail step %d (token unit): fraction %.3f dropped %d of %d scorable tokens, kept tokens %.3f, "
+                            "loss %.4f unfiltered %.4f, threshold margin %.4f, mean margin %.4f",
+                            step,
+                            float(metrics["train/tail/fraction"]),
+                            int(metrics["train/tail/dropped_tokens"]),
+                            int(metrics["train/tail/scorable_tokens"]),
+                            float(metrics["train/tail/kept_token_frac"]),
+                            float(metrics["train/loss"]),
+                            float(metrics["train/tail/loss_unfiltered"]),
+                            float(metrics["train/tail/threshold_margin"]),
+                            float(metrics["train/tail/mean_margin"]),
+                        )
+                    elif tail is not None and step % log_every == 0:
                         # The tracker is offline on the clusters; keep the filter's behaviour in the run log.
                         logger.info(
                             "tail step %d: fraction %.3f dropped %d of %d scorable (%d present), kept tokens %.3f, "
