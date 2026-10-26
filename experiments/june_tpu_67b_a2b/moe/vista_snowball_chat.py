@@ -1394,6 +1394,8 @@ def snowball_chat_run_config(
     track_ema_alpha = float(os.environ.get("SNOWBALL_TRACK_EMA_ALPHA") or 0.0)
     track_reenter = os.environ.get("SNOWBALL_TRACK_REENTER") or "either"
     track_drop_weight = float(os.environ.get("SNOWBALL_TRACK_DROP_WEIGHT") or 0.0)
+    # SNOWBALL_TRACK_DROP_BAND: which flat tokens are dropped, "all" (default), "learned" or "stuck" (ablations).
+    track_drop_band = os.environ.get("SNOWBALL_TRACK_DROP_BAND") or "all"
     # SNOWBALL_TRACK_OBSERVE_ONLY=1: record per-token histories (and a trace) without dropping anything (plain SFT).
     track_observe_only = os.environ.get("SNOWBALL_TRACK_OBSERVE_ONLY", "0") == "1"
     # SNOWBALL_TRACE_DOCS > 0: token trace of that many randomly chosen documents into SNOWBALL_TRACE_OUT.
@@ -1456,6 +1458,7 @@ def snowball_chat_run_config(
             track_ema_alpha=track_ema_alpha,
             track_reenter=track_reenter,
             track_drop_weight=track_drop_weight,
+            track_drop_band=track_drop_band,
             track_observe_only=track_observe_only,
             trace_num_docs=trace_num_docs,
             trace_seed=trace_seed,

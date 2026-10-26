@@ -212,3 +212,29 @@ def test_drop_weight_downweights_instead_of_removing():
     assert np.allclose(g[:2], 0.25 * g[2]) and np.allclose(g[2], g[3]) and g[2] > 0
     loss0, _ = f(jnp.asarray(now * w), 0.0)
     assert abs(float(loss0) - (0.5 + 0.6) / 2) < 1e-6, "drop_weight 0 removes the dropped tokens"
+
+def test_drop_band_drops_only_one_band():
+    # Six tokens: two flat at a low loss (learned), two flat at a high loss (stuck), two moving. "learned" drops only the
+    # first pair, "stuck" only the second, "all" both; moving tokens are always kept and gradient lands on kept only.
+    p2 = np.array([0.02, 0.02, 1.5, 1.5, 2.0, 2.0], np.float32); p1 = np.array([0.02, 0.02, 1.5, 1.5, 1.0, 1.0], np.float32)
+    now = np.array([0.02, 0.02, 1.5, 1.5, 0.5, 0.6], np.float32); c = np.full(6, 2.0, np.float32); w = np.ones(6, np.float32)
+    d = jnp.zeros(6)
+    f = lambda pp, band: tt.tracked_loss(pp, jnp.asarray(w), jnp.asarray(p1), jnp.asarray(p2), jnp.asarray(c), d, tol=TOL, floor=FLOOR, drop_band=band)
+    expect = {tt.DropBand.ALL: [False, False, False, False, True, True], tt.DropBand.LEARNED: [False, False, True, True, True, True],
+              tt.DropBand.STUCK: [True, True, False, False, True, True]}
+    for band, kept in expect.items():
+        kept = np.array(kept); loss, s = f(jnp.asarray(now * w), band)
+        assert abs(float(loss) - float(now[kept].mean())) < 1e-6, band
+        assert int(s["track/kept_tokens"]) == int(kept.sum()), band
+        g = np.asarray(jax.grad(lambda x: f(x, band)[0])(jnp.asarray(now * w)))
+        assert np.all(g[~kept] == 0) and np.all(g[kept] > 0), band
+        host = tt.decide(p1, p2, c, np.zeros(6), now, tol=TOL, floor=FLOOR, reentry=tt.Reentry.EITHER, drop_band=band)
+        assert np.array_equal(host, ~kept), band
+
+def test_drop_band_host_rule_matches_training_mask():
+    for band in tt.DropBand:
+        for seed in range(3):
+            p1, p2, c, now, w = _random_history(seed)
+            _, stats = tt.tracked_loss(jnp.asarray(now * w), jnp.asarray(w), jnp.asarray(p1), jnp.asarray(p2), jnp.asarray(c), jnp.zeros_like(jnp.asarray(c)), tol=TOL, floor=FLOOR, drop_band=band)
+            dropped = (w > 0) & tt.decide(p1, p2, c, np.zeros_like(c), now, tol=TOL, floor=FLOOR, reentry=tt.Reentry.EITHER, drop_band=band)
+            assert int(stats["track/kept_tokens"]) == int(((w > 0) & ~dropped).sum()), (band, seed)

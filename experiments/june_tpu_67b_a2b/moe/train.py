@@ -186,6 +186,8 @@ class GrugTrainerConfig:
     track_reenter: str = "either"
     # Weight a dropped token keeps (token_track.tracked_loss): 0 removes it, 0 < x < 1 down-weights it instead.
     track_drop_weight: float = 0.0
+    # Which flat tokens are dropped (token_track.DropBand): "all" (Plateau Dropping), "learned" or "stuck" (ablations).
+    track_drop_band: str = "all"
     # Observe-only tracking: run the tracking path with tol 0, so no token is ever dropped (the loss is plain SFT's),
     # while the per-token history and the token trace are still recorded. The plain-SFT side of the token analysis.
     track_observe_only: bool = False
@@ -673,7 +675,7 @@ def _make_train_step(
                 loss, track_stats = _track_loss_sharded(
                     per_pos, batch.loss_weight, track_prev1, track_prev2, track_count, track_dropped, tol=track.tol,
                     floor=track.floor, ema_alpha=track.ema_alpha, reentry=track.reentry,
-                    drop_weight=track.drop_weight,
+                    drop_weight=track.drop_weight, drop_band=track.drop_band,
                 )
                 loss = loss + summarized["train/router/aux_loss_weighted"]
                 summarized = dict(summarized)
@@ -850,6 +852,7 @@ class TrackSettings:
     ema_alpha: float = 0.0
     reentry: token_track.Reentry = token_track.Reentry.EITHER
     drop_weight: float = 0.0
+    drop_band: token_track.DropBand = token_track.DropBand.ALL
 
 
 @dataclass(frozen=True)
@@ -1050,13 +1053,13 @@ def _clip_loss_sharded(per_pos, weight, batch, random_keep, active, *, p_hi, p_l
 
 
 def _track_loss_sharded(per_pos, weight, prev1, prev2, count, dropped, *, tol, floor, ema_alpha=0.0,
-                        reentry=token_track.Reentry.EITHER, drop_weight=0.0):
+                        reentry=token_track.Reentry.EITHER, drop_weight=0.0, drop_band=token_track.DropBand.ALL):
     """Tracked-token loss over local rows; the history arrays arrive as row-sharded inputs."""
     stats_specs = {k: P() for k in token_track.TRACK_STAT_KEYS}
 
     def _fn(a, b, x, y, z, d, *, psum):
         return token_track.tracked_loss(a, b, x, y, z, d, tol=tol, floor=floor, ema_alpha=ema_alpha, reentry=reentry,
-                                        drop_weight=drop_weight, psum=psum)
+                                        drop_weight=drop_weight, drop_band=drop_band, psum=psum)
 
     return _tail_shard_map_rows(_fn, (per_pos, weight, prev1, prev2, count, dropped), (), out_specs=(P(), stats_specs))
 
@@ -1368,11 +1371,14 @@ def run_grug_local(config: GrugRunConfig) -> None:
         tol = 0.0 if config.trainer.track_observe_only else float(config.trainer.track_tol)
         track = TrackSettings(tol=tol, floor=float(config.trainer.track_floor), ema_alpha=float(config.trainer.track_ema_alpha),
                               reentry=token_track.Reentry(config.trainer.track_reenter),
-                              drop_weight=float(config.trainer.track_drop_weight))
+                              drop_weight=float(config.trainer.track_drop_weight),
+                              drop_band=token_track.DropBand(config.trainer.track_drop_band))
         if not 0.0 <= track.drop_weight < 1.0:
             raise ValueError(f"track_drop_weight must be in [0, 1), got {track.drop_weight}")
         if track.reentry is not token_track.Reentry.EITHER and (track.ema_alpha > 0 or config.trainer.trace_num_docs > 0):
             raise ValueError("track_reenter other than 'either' supports neither track_ema_alpha nor the token trace")
+        if track.drop_band is not token_track.DropBand.ALL and (track.ema_alpha > 0 or config.trainer.trace_num_docs > 0):
+            raise ValueError("track_drop_band other than 'all' supports neither track_ema_alpha nor the token trace")
         track_history = token_track.TokenHistory(int(config.trainer.tail_num_docs), int(config.trainer.track_max_len))
         if config.trainer.trace_num_docs > 0:
             if not config.trainer.trace_out:
@@ -1387,7 +1393,7 @@ def run_grug_local(config: GrugRunConfig) -> None:
                 np.save(os.path.join(config.trainer.trace_out, "trace-docs.npy"), np.sort(trace_docs))
             logger.info(f"Token trace on: {n} documents (seed {config.trainer.trace_seed}) -> {config.trainer.trace_out}")
         logger.info(
-            f"Per-token tracking on: tol={track.tol} floor={track.floor} ema_alpha={track.ema_alpha} reentry={track.reentry} drop_weight={track.drop_weight} table "
+            f"Per-token tracking on: tol={track.tol} floor={track.floor} ema_alpha={track.ema_alpha} reentry={track.reentry} drop_weight={track.drop_weight} drop_band={track.drop_band} table "
             f"{track_history.num_docs} docs x {track_history.max_len} = {track_history.num_docs * track_history.max_len:,} keys"
         )
     clip: ClipSettings | None = None
@@ -1640,7 +1646,7 @@ def run_grug_local(config: GrugRunConfig) -> None:
                         diag = track_history.update_ema(keys, loss_now, floor=track.floor, alpha=track.ema_alpha)
                     else:
                         dropped_now = token_track.decide(p1, p2, cnt, prev_dropped, loss_now, tol=track.tol, floor=track.floor,
-                                                         reentry=track.reentry)
+                                                         reentry=track.reentry, drop_band=track.drop_band)
                         diag = track_history.update(keys, loss_now, dropped_now)
                     if diag["duplicate_keys"]:
                         logger.warning(

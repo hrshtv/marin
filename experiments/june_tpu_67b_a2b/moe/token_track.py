@@ -10,6 +10,8 @@ either already learned or not learnable - and it gets no gradient this visit. Ob
 token whose loss later moves by more than ``tol`` is no longer flat and is trained again. With ``Reentry.RISE`` only
 a rise brings it back: a dropped token whose loss falls stays dropped (the history keeps each token's last decision).
 With ``drop_weight > 0`` a dropped token is down-weighted instead of removed: its loss keeps that fraction of its weight.
+``DropBand`` restricts dropping to one band of flat tokens (an ablation): ``learned`` drops only flat tokens whose loss
+is below ``ALREADY_LEARNED_LOSS``, ``stuck`` only those at or above it; the other flat tokens stay in the loss.
 
 Mechanics. A token is keyed by (cache row, offset within the row), which is stable across epochs because the
 cache row IS the document and packing only moves whole documents. A replicated host-side table holds each
@@ -51,6 +53,23 @@ class Reentry(StrEnum):
 
     EITHER = "either"  # its loss moved by more than tol in either direction (it is no longer flat)
     RISE = "rise"  # its loss rose by more than tol; a falling loss keeps it dropped
+
+
+class DropBand(StrEnum):
+    """Which flat tokens are dropped, split by the current loss at ``ALREADY_LEARNED_LOSS``."""
+
+    ALL = "all"  # every flat token (Plateau Dropping)
+    LEARNED = "learned"  # only flat tokens below ALREADY_LEARNED_LOSS; flat high-loss tokens are trained
+    STUCK = "stuck"  # only flat tokens at or above ALREADY_LEARNED_LOSS; flat low-loss tokens are trained
+
+
+def in_band(flat, now, band: DropBand):
+    """``flat`` restricted to ``band`` (numpy or jax arrays; ``now`` is the current per-token loss)."""
+    if band is DropBand.LEARNED:
+        return flat & (now < ALREADY_LEARNED_LOSS)
+    if band is DropBand.STUCK:
+        return flat & (now >= ALREADY_LEARNED_LOSS)
+    return flat
 
 
 def token_keys(segment_ids: np.ndarray, weight: np.ndarray, num_docs: int, max_len: int) -> np.ndarray:
@@ -222,16 +241,17 @@ def plateaued(prev1: np.ndarray, prev2: np.ndarray, count: np.ndarray, loss_now:
 
 
 def decide(prev1: np.ndarray, prev2: np.ndarray, count: np.ndarray, prev_dropped: np.ndarray, loss_now: np.ndarray, *,
-           tol: float, floor: float, reentry: Reentry) -> np.ndarray:
-    """Host copy of ``tracked_loss``'s drop decision for the hard rule, including the re-entry rule."""
+           tol: float, floor: float, reentry: Reentry, drop_band: DropBand = DropBand.ALL) -> np.ndarray:
+    """Host copy of ``tracked_loss``'s drop decision for the hard rule, including the re-entry rule and drop band."""
     flat = plateaued(prev1, prev2, count, loss_now, tol=tol, floor=floor)
+    now_f = np.asarray(loss_now, dtype=np.float32)
     if reentry is Reentry.EITHER:
-        return flat
+        return in_band(flat, now_f, drop_band)
     p1, now = (np.asarray(a, dtype=np.float32) for a in (prev1, loss_now))
     was = np.asarray(prev_dropped) > 0.5
     with np.errstate(invalid="ignore"):
         stays = was & np.isfinite(p1) & np.isfinite(now) & ((now - p1) / np.maximum(p1, np.float32(floor)) < tol)
-    return np.where(was, stays, flat)
+    return in_band(np.where(was, stays, flat), now_f, drop_band)
 
 
 def tracked_loss(
@@ -247,6 +267,7 @@ def tracked_loss(
     ema_alpha: float = 0.0,
     reentry: Reentry = Reentry.EITHER,
     drop_weight: float = 0.0,
+    drop_band: DropBand = DropBand.ALL,
     psum: tail_filter.PsumFn = tail_filter._identity,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Token-mean loss over the tokens whose loss is still moving, with replicated diagnostics.
@@ -262,7 +283,7 @@ def tracked_loss(
     by at least ``tol`` (signed change ``(now - prev1) / max(prev1, floor)``).
 
     ``drop_weight`` is the weight a dropped token keeps (0 removes it). The loss is the weighted mean over kept tokens
-    at weight 1 and dropped tokens at ``drop_weight``.
+    at weight 1 and dropped tokens at ``drop_weight``. ``drop_band`` limits dropping to one band of flat tokens.
     """
     w = weight.reshape(-1).astype(jnp.float32)
     pp = per_pos.reshape(-1).astype(jnp.float32)
@@ -284,6 +305,7 @@ def tracked_loss(
     if reentry is Reentry.RISE:
         was = trained & (prev_dropped.reshape(-1) > 0.5) & jnp.isfinite(p1)
         flat = jnp.where(was, (now - p1) / jnp.maximum(p1, floor) < tol, flat)
+    flat = in_band(flat, now, drop_band)
     keep = jax.lax.stop_gradient(trained & ~flat)
     drop = trained & flat
     f = lambda m: psum(jnp.sum(m.astype(jnp.float32)))
