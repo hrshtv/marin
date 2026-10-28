@@ -969,6 +969,26 @@ STAGES: dict[str, StageSpec] = {
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
     ),
+    # Open-SWE-Traces v1.2 mini-swe-agent rows in their NATIVE harness format (upstream mini-swe-agent tool-calling: all tool
+    # calls of a turn kept with ids, JSON observations verbatim, the v1.2 system prompt and task turn), built by
+    # data/openswe_msa_native/build_openswe_msa_native.py (SWE scaling study, 2026-10-28). Row cap 131,072 tokens under the 0921
+    # template; train at SNOWBALL_SEQ_LEN=131072 (or a 65,536-capped cut at 65536). One cache per mix, each recording its
+    # parquet list; the ceiling covers 8 passes of the full ~47k-row resolved pool (~290 steps per pass at 64 x 131,072).
+    "openswe_native_v12_g0921": StageSpec(
+        "messages",
+        "openswe_native_v12",
+        "s4_openswe_native_v12",
+        4000,
+        init_step=0,
+        cache_tokens=None,
+        cache_examples=None,
+        cache_shards=1,
+        dataset_revision="e192b26a43b8d09f156eeee781aef8e6bd5108ba",
+        source_files=1,
+        chat_template=GRUG0921_CHAT_TEMPLATE,
+        fixed_steps=None,
+        optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
+    ),
     # The same Open-SWE v1.2 mini-swe-agent parquet (same messages field, same pinned revision), rendered with Qwen3-8B's
     # stock chat template plus {% generation %} markers (experiments/plateau_dropping_qwen/qwen3_template.py) for the
     # Levanter Qwen3-8B trainer (experiments/plateau_dropping_qwen/qwen_sft.py). Build the cache with the Qwen3
