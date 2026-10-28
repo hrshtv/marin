@@ -974,6 +974,8 @@ STAGES: dict[str, StageSpec] = {
     # data/openswe_msa_native/build_openswe_msa_native.py (SWE scaling study, 2026-10-28). Row cap 131,072 tokens under the 0921
     # template; train at SNOWBALL_SEQ_LEN=131072 (or a 65,536-capped cut at 65536). One cache per mix, each recording its
     # parquet list; the ceiling covers 8 passes of the full ~47k-row resolved pool (~290 steps per pass at 64 x 131,072).
+    # The mix is written as 8 contiguous parquet shards (filter_rows.py --shards 8): the single-shard cache writer slows from
+    # ~800 to ~80 records/min past ~6k records, so one worker per shard keeps each in the fast regime.
     "openswe_native_v12_g0921": StageSpec(
         "messages",
         "openswe_native_v12",
@@ -982,9 +984,9 @@ STAGES: dict[str, StageSpec] = {
         init_step=0,
         cache_tokens=None,
         cache_examples=None,
-        cache_shards=1,
+        cache_shards=8,
         dataset_revision="e192b26a43b8d09f156eeee781aef8e6bd5108ba",
-        source_files=1,
+        source_files=8,
         chat_template=GRUG0921_CHAT_TEMPLATE,
         fixed_steps=None,
         optimizer=SNOWBALL_AGENTIC_OPTIMIZER,
