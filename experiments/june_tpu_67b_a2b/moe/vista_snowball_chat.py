@@ -559,8 +559,10 @@ def preflight_snowball_chat(
         expect_tokens=_spec.cache_tokens,
         expect_examples=_spec.cache_examples,
     )
-    if cache_shards != _spec.cache_shards:
+    if _spec.cache_shards is not None and cache_shards != _spec.cache_shards:
         raise ValueError(f"{stage} cache has {cache_shards} finished shards; expected {_spec.cache_shards}.")
+    if cache_shards < 1:
+        raise ValueError(f"{stage} cache has no finished shards.")
     validate_cache_provenance(data_cache_path, stage, tokenizer_path)
     tokenizer_vocab_size = _validate_tokenizer(tokenizer_path)
 
@@ -628,7 +630,7 @@ class StageSpec:
     init_step: int  # EXACT step the init checkpoint must report
     cache_tokens: int | None  # exact packed-token count of this stage's cache; None => structural check only
     cache_examples: int | None  # exact packed-example count; None => structural check only
-    cache_shards: int  # exact finished-shard count
+    cache_shards: int | None  # exact finished-shard count; None => any count >= 1 (writer groups small mixes)
     dataset_revision: str  # pinned dataset commit this cache was built from
     chat_template: str  # Delphi V0 for chat/thinking; Marin for nemotron_terminal
     fixed_steps: int | None  # a stage with a mandated budget (1888) rather than an epoch
@@ -984,7 +986,9 @@ STAGES: dict[str, StageSpec] = {
         init_step=0,
         cache_tokens=None,
         cache_examples=None,
-        cache_shards=8,
+        # The cache writer groups small inputs: the 5,979-row U/8 mix (8 parquet files) came out as 5 finished shards,
+        # the 11,961-row U/4 mix as 8. The cache job checks the row/token totals; the shard count is not pinned.
+        cache_shards=None,
         dataset_revision="e192b26a43b8d09f156eeee781aef8e6bd5108ba",
         source_files=8,
         chat_template=GRUG0921_CHAT_TEMPLATE,
